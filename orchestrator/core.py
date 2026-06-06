@@ -24,10 +24,10 @@ from .interfaces import Manipulator, Navigator, PickStatus, Pose, Sensors
 class OrchState(Enum):
     IDLE = "idle"
     NAVIGATING = "navigating"  # driving toward the dock
-    SETTLING = "settling"      # braked, confirming stationary before we pick
-    PICKING = "picking"        # arm running; waiting for the button (or timeout)
+    SETTLING = "settling"  # braked, confirming stationary before we pick
+    PICKING = "picking"  # arm running; waiting for the button (or timeout)
     RETRACTING = "retracting"  # arm returning to neutral, clear of the car
-    DEPARTING = "departing"    # driving away from the dock
+    DEPARTING = "departing"  # driving away from the dock
     DONE = "done"
     ABORTED = "aborted"
     ERROR = "error"

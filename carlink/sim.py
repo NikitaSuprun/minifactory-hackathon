@@ -42,7 +42,9 @@ class SimCar:
         self.board = Board(self.mt)
         self._dt = 1.0 / hz
         self._stop = threading.Event()
-        self._thread = threading.Thread(target=self._loop, name=f"sim-{name}", daemon=True)
+        self._thread = threading.Thread(
+            target=self._loop, name=f"sim-{name}", daemon=True
+        )
         # simulated physical state
         self._heading = 0.0
         self._dist = 2000.0  # mm to the nearest obstacle ahead
@@ -74,7 +76,7 @@ class SimCar:
         for a in sent[self._seen :]:
             k, v = a.key, a.value
             try:
-                n = int(float(v)) if v not in (None, "") else 0
+                n = int(float(v)) if isinstance(v, (int, float, str)) else 0
             except (TypeError, ValueError):
                 n = 0
             if k in ("stop", "motor_brake", "motor_stop", "disable"):
@@ -103,7 +105,9 @@ class SimCar:
             if stale:
                 self._throttle = self._steer = 0
             # integrate a toy motion model
-            self._heading = (self._heading + self._steer * self._dt * 0.5 + 180) % 360 - 180
+            self._heading = (
+                self._heading + self._steer * self._dt * 0.5 + 180
+            ) % 360 - 180
             if self._throttle > 0:
                 self._dist = max(80.0, self._dist - self._throttle * self._dt * 2.0)
             else:
@@ -111,9 +115,16 @@ class SimCar:
             obstacle = self._dist < 300
             # stream telemetry
             self.mt.push_wire(
-                _wire("sensor", "orientation", f"0.0,179.0,{self._heading:.1f}", "icm40608_imu")
+                _wire(
+                    "sensor",
+                    "orientation",
+                    f"0.0,179.0,{self._heading:.1f}",
+                    "icm40608_imu",
+                )
             )
-            self.mt.push_wire(_wire("sensor", "min_distance", int(self._dist), "vl53l5cx_distance"))
+            self.mt.push_wire(
+                _wire("sensor", "min_distance", int(self._dist), "vl53l5cx_distance")
+            )
             self.mt.push_wire(_wire("state", "status", "ready"))
             if obstacle != last_obstacle:
                 self.mt.push_wire(

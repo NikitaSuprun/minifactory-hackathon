@@ -1,6 +1,6 @@
 """Hardware-free demo of the orchestrator state machine over the mock backends.
 
-    uv run python -m orchestrator
+uv run python -m orchestrator
 """
 
 from __future__ import annotations

@@ -83,7 +83,9 @@ class GatewayTransport:
         self.connected_devices = False
         self.last_error: Optional[str] = None
         self._stop = threading.Event()
-        self._thread = threading.Thread(target=self._reader, name="atech-gw", daemon=True)
+        self._thread = threading.Thread(
+            target=self._reader, name="atech-gw", daemon=True
+        )
         self._thread.start()
 
     # -- background reader --
@@ -99,7 +101,9 @@ class GatewayTransport:
                 continue
             if not raw:
                 continue
-            self._ingest(raw if isinstance(raw, str) else raw.decode("utf-8", "replace"))
+            self._ingest(
+                raw if isinstance(raw, str) else raw.decode("utf-8", "replace")
+            )
 
     def _ingest(self, text: str) -> None:
         try:
@@ -146,7 +150,9 @@ class GatewayTransport:
         with self._lock:
             return self._latest.get(key)
 
-    def boot_report(self, *, reset: bool = True, timeout: float = 5.0) -> Optional[dict]:
+    def boot_report(
+        self, *, reset: bool = True, timeout: float = 5.0
+    ) -> Optional[dict]:
         return None  # no boot diagnostics over the gateway
 
     def close(self) -> None:

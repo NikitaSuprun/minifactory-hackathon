@@ -44,7 +44,9 @@ class Car:
     name: str = "car"
 
     # Actuators — pick ONE motor style:
-    motors: tuple[str, ...] = ()  # per-wheel dc_motor instances, e.g. ("fl","fr","rl","rr")
+    motors: tuple[
+        str, ...
+    ] = ()  # per-wheel dc_motor instances, e.g. ("fl","fr","rl","rr")
     drive_action: str = "motor_speed"  # global action when motors is empty
     brake_action: str = "motor_brake"
     coast_action: str = "motor_stop"

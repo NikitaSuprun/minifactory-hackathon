@@ -24,7 +24,9 @@ class MockSensors:
     """Station board. Reads are the Sensors contract; the ``set_*``/``press_*``
     writes are how the 'world' (navigator/arm) pokes it — not part of the contract."""
 
-    def __init__(self, present_distance_mm: float = 50.0, clear_distance_mm: float = 1000.0):
+    def __init__(
+        self, present_distance_mm: float = 50.0, clear_distance_mm: float = 1000.0
+    ):
         self._car_present = False
         self._car_distance_mm: float | None = None
         self._button = False
@@ -125,7 +127,9 @@ class MockManipulator:
     """An arm that 'picks' for ``pick_s`` and then presses the station button.
     ``to_neutral`` blocks for ``neutral_s`` to model the arm settling."""
 
-    def __init__(self, sensors: MockSensors, pick_s: float = 2.0, neutral_s: float = 0.5):
+    def __init__(
+        self, sensors: MockSensors, pick_s: float = 2.0, neutral_s: float = 0.5
+    ):
         self.sensors = sensors
         self.pick_s = pick_s
         self.neutral_s = neutral_s
@@ -144,7 +148,9 @@ class MockManipulator:
         return self._status
 
     def to_neutral(self) -> None:
-        time.sleep(self.neutral_s)  # blocks: the car must not move until the arm is clear
+        time.sleep(
+            self.neutral_s
+        )  # blocks: the car must not move until the arm is clear
         self._status = PickStatus.IDLE
 
     def stop(self) -> None:

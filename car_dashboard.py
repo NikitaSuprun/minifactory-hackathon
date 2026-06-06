@@ -67,7 +67,7 @@ POLICIES: dict[str, Any] = {
 
 
 def parse_cars(spec: str) -> dict[str, str]:
-    """"car_a=/dev/ttyA,car_b=gw:PID" -> {"car_a": "/dev/ttyA", "car_b": "gw:PID"}."""
+    """ "car_a=/dev/ttyA,car_b=gw:PID" -> {"car_a": "/dev/ttyA", "car_b": "gw:PID"}."""
     cars: dict[str, str] = {}
     for chunk in spec.split(","):
         chunk = chunk.strip()
@@ -90,7 +90,9 @@ def _build_slot(name: str, target: str) -> "CarSlot":
     else:
         board = connect_serial(target or None)
     car = Car(board, name=name)
-    return CarSlot(car=car, runner=PolicyRunner(car, hz=POLICY_HZ), target=target, sim=sim)
+    return CarSlot(
+        car=car, runner=PolicyRunner(car, hz=POLICY_HZ), target=target, sim=sim
+    )
 
 
 # --- Authentication (HTTP Basic on every route) -----------------------------
@@ -98,9 +100,9 @@ _basic = HTTPBasic()
 
 
 def require_auth(credentials: HTTPBasicCredentials = Depends(_basic)) -> str:
-    ok = secrets.compare_digest(credentials.username, DASHBOARD_USER) and secrets.compare_digest(
-        credentials.password, DASHBOARD_PASS
-    )
+    ok = secrets.compare_digest(
+        credentials.username, DASHBOARD_USER
+    ) and secrets.compare_digest(credentials.password, DASHBOARD_PASS)
     if not ok:
         raise HTTPException(401, "Unauthorized", {"WWW-Authenticate": "Basic"})
     return credentials.username
@@ -195,16 +197,23 @@ def connect() -> dict[str, Any]:
             opened.append(name)
         except Exception as e:  # noqa: BLE001
             failed[name] = str(e)
-    state.error = (
-        "; ".join(f"{n}: {m}" for n, m in failed.items()) if failed else None
-    )
-    return {"status": "connected", "cars": list(state.cars), "opened": opened, "failed": failed}
+    state.error = "; ".join(f"{n}: {m}" for n, m in failed.items()) if failed else None
+    return {
+        "status": "connected",
+        "cars": list(state.cars),
+        "opened": opened,
+        "failed": failed,
+    }
 
 
 @app.post("/car/{name}/reconnect")
 def reconnect(name: str) -> dict[str, str]:
     """Reopen a single car (e.g. after a serial drop) without touching the others."""
-    target = state.cars[name].target if name in state.cars else dict(parse_cars(ATECH_CARS)).get(name)
+    target = (
+        state.cars[name].target
+        if name in state.cars
+        else dict(parse_cars(ATECH_CARS)).get(name)
+    )
     if target is None:
         raise HTTPException(404, f"{name} is not in $ATECH_CARS")
     if name in state.cars:

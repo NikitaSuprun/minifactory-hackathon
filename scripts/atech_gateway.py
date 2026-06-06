@@ -47,9 +47,6 @@ def main() -> int:
             print("DRIVE DEMO — watch the car (forward, turn, spin, stop)")
             steps = [
                 ("forward 150", lambda: car.drive(150)),
-                ("turn_left", car.turn_left),
-                ("turn_right", car.turn_right),
-                ("spin_left", car.spin_left),
                 ("stop", car.stop),
             ]
             for label, fn in steps:

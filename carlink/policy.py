@@ -92,7 +92,9 @@ class PolicyRunner:
         self.policy = policy
         self.last_error = None
         self._stop.clear()
-        self._thread = threading.Thread(target=self._loop, name="atech-policy", daemon=True)
+        self._thread = threading.Thread(
+            target=self._loop, name="atech-policy", daemon=True
+        )
         self._thread.start()
 
     def stop(self) -> None:

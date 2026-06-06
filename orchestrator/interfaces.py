@@ -34,7 +34,7 @@ class Pose:
 class PickStatus(Enum):
     IDLE = "idle"
     RUNNING = "running"
-    DONE = "done"        # the pick finished (button fired) — policy believes it's done
+    DONE = "done"  # the pick finished (button fired) — policy believes it's done
     TIMEOUT = "timeout"  # safety fallback fired before the button
     ERROR = "error"
 
