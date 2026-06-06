@@ -30,17 +30,12 @@ import camera_lock
 
 from lerobot.async_inference.configs import RobotClientConfig
 from lerobot.async_inference.robot_client import RobotClient
-from lerobot.cameras.configs import CameraConfig
-from lerobot.cameras.opencv import OpenCVCameraConfig
 from lerobot.robots.so_follower.config_so_follower import SO101FollowerConfig
 from lerobot.utils.import_utils import register_third_party_plugins
 
-from phone_camera import (
-    adopt_network_stream_profile,
-    build_phone_camera_config,
-    resolve_phone_url,
-    tolerate_camera_resolution_drift,
-)
+# Importing recording pulls in phone_camera (which loads .env / .env.local) and the shared
+# camera assembly. camera1 is required; camera2/camera3 are optional for inference.
+from recording import build_cameras
 
 _HERE: Final[Path] = Path(__file__).resolve().parent
 CALIBRATION_DIR: Final[str] = os.environ.get("CALIBRATION_DIR") or str(
@@ -58,28 +53,6 @@ CLIENT_DEVICE: Final[str] = os.environ.get("CLIENT_DEVICE", "cpu")
 ACTIONS_PER_CHUNK: Final[str] = os.environ.get("ACTIONS_PER_CHUNK", "50")
 CHUNK_SIZE_THRESHOLD: Final[str] = os.environ.get("CHUNK_SIZE_THRESHOLD", "0.5")
 AGGREGATE_FN: Final[str] = os.environ.get("AGGREGATE_FN", "weighted_average")
-# A LeRobot robot config requires width/height/fps on every camera, so set them to
-# match what the IP Webcam app emits. The phone is a network MJPEG stream whose
-# resolution can't actually be changed via OpenCV — allow_network_stream_resolution()
-# (below) lets LeRobot accept these values instead of failing on VideoCapture.set.
-# Camera names become the policy-facing image-feature slots (observation.images.<name>);
-# they must match the loaded policy's expected keys. smolvla_base uses camera1/camera2/camera3.
-PHONE_CAMERA_NAME: Final[str] = os.environ.get("ROBOT_CAMERA_NAME", "camera1")
-PHONE_CAM_WIDTH: Final[str] = os.environ.get("PHONE_CAM_WIDTH", "640")
-PHONE_CAM_HEIGHT: Final[str] = os.environ.get("PHONE_CAM_HEIGHT", "480")
-PHONE_CAM_FPS: Final[str] = os.environ.get("PHONE_CAM_FPS", "30")
-ARM_CAM_INDEX: Final[str] = os.environ.get("ARM_CAM_INDEX", "")
-ARM_CAM_NAME: Final[str] = os.environ.get("ARM_CAM_NAME", "camera2")
-ARM_CAM_WIDTH: Final[str] = os.environ.get("ARM_CAM_WIDTH", "640")
-ARM_CAM_HEIGHT: Final[str] = os.environ.get("ARM_CAM_HEIGHT", "480")
-ARM_CAM_FPS: Final[str] = os.environ.get("ARM_CAM_FPS", "30")
-CAM3_INDEX: Final[str] = os.environ.get("CAM3_INDEX", "")
-CAM3_NAME: Final[str] = os.environ.get("CAM3_NAME", "camera3")
-CAM3_WIDTH: Final[str] = os.environ.get("CAM3_WIDTH", "640")
-CAM3_HEIGHT: Final[str] = os.environ.get("CAM3_HEIGHT", "480")
-CAM3_FPS: Final[str] = os.environ.get("CAM3_FPS", "30")
-# "opencv" (cv2 device index) or "oak" (Luxonis OAK-D via depthai).
-CAM3_SOURCE: Final[str] = os.environ.get("CAM3_SOURCE", "opencv").strip().lower()
 
 
 # Seconds to wait after claiming the camera lock so the dashboard can release the
@@ -108,47 +81,13 @@ def main() -> None:
     signal.signal(signal.SIGTERM, _release_and_exit)
     time.sleep(CAMERA_LOCK_GRACE_S)
 
-    # Cameras sent to the policy: the phone stream (URL, kept as a string so the URL
-    # survives intact) and, if present, the USB wrist camera (device index). The dict keys
-    # are the policy's observation.images.<key> slots (see PHONE_CAMERA_NAME/ARM_CAM_NAME).
-    # Both carry width/height/fps (required by the robot config); the patches below let the
-    # phone's read-only network stream adopt its actual profile, and any camera tolerate a
-    # delivered frame size that differs from the configured one (e.g. the wrist's 640x360).
-    adopt_network_stream_profile()
-    tolerate_camera_resolution_drift()
-    cameras: dict[str, CameraConfig] = {
-        PHONE_CAMERA_NAME: build_phone_camera_config(
-            resolve_phone_url(),
-            width=int(PHONE_CAM_WIDTH),
-            height=int(PHONE_CAM_HEIGHT),
-            fps=int(PHONE_CAM_FPS),
-        )
-    }
-    if ARM_CAM_INDEX != "":
-        cameras[ARM_CAM_NAME] = OpenCVCameraConfig(
-            index_or_path=int(ARM_CAM_INDEX),
-            width=int(ARM_CAM_WIDTH),
-            height=int(ARM_CAM_HEIGHT),
-            fps=int(ARM_CAM_FPS),
-        )
-    # camera3 is the Luxonis OAK-D (depthai) when CAM3_SOURCE=oak; LeRobot builds it via
-    # its make_device_from_device_class fallback (OakDepthAICameraConfig -> OakDepthAICamera,
-    # registered in oak_lerobot_camera). Otherwise it's a plain cv2 device index.
-    if CAM3_SOURCE == "oak":
-        from oak_lerobot_camera import OakDepthAICameraConfig
-
-        cameras[CAM3_NAME] = OakDepthAICameraConfig(
-            width=int(CAM3_WIDTH),
-            height=int(CAM3_HEIGHT),
-            fps=int(CAM3_FPS),
-        )
-    elif CAM3_INDEX != "":
-        cameras[CAM3_NAME] = OpenCVCameraConfig(
-            index_or_path=int(CAM3_INDEX),
-            width=int(CAM3_WIDTH),
-            height=int(CAM3_HEIGHT),
-            fps=int(CAM3_FPS),
-        )
+    # Cameras sent to the policy: phone(camera1) + USB(camera2) + OAK-D/USB(camera3). All
+    # three are required (same as recording) so the observation.images.<key> slots always
+    # match the loaded policy (smolvla_base: camera1/camera2/camera3).
+    try:
+        cameras = build_cameras()
+    except ValueError as e:
+        sys.exit(str(e))
 
     robot_cfg = SO101FollowerConfig(
         port=FOLLOWER_PORT,

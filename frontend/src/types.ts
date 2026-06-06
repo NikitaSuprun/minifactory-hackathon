@@ -1,13 +1,3 @@
-export interface RecordProgress {
-  phase?: string;
-  current_episode?: number;
-  total_episodes?: number;
-  episode_started_at?: number;
-  episode_time_s?: number;
-  repo_id?: string;
-  message?: string;
-}
-
 export interface Status {
   connected: boolean;
   teleop_running: boolean;
@@ -27,7 +17,11 @@ export interface Status {
   record_status: string;
   record_repo_id: string | null;
   record_last_done_repo: string | null;
-  record_progress: RecordProgress;
+  record_current_episode: number;
+  record_total_episodes: number;
+  record_started_at: number; // epoch seconds; 0 when idle
+  record_phase_started_at: number;
+  record_phase_time_s: number;
 }
 
 export interface DatasetInfo {

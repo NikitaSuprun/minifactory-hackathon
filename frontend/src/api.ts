@@ -6,9 +6,7 @@ export async function getStatus(): Promise<Status> {
   return r.json();
 }
 
-export async function getLog(
-  which: "server" | "client" | "record",
-): Promise<string> {
+export async function getLog(which: "server" | "client"): Promise<string> {
   const r = await fetch(`/logs/${which}`);
   if (!r.ok) return `(log ${which} unavailable)`;
   return (await r.json()).text as string;

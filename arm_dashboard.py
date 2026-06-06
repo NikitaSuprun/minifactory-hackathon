@@ -48,8 +48,11 @@ from pydantic import BaseModel
 
 import camera_lock
 
-# Importing phone_camera also loads .env and .env.local (HF_TOKEN) on import.
-from phone_camera import open_phone_camera
+# Importing phone_camera loads .env and .env.local (HF_TOKEN) on import. The recording
+# helpers (build_cameras / resolve_hf_username / run_record_session) and the lerobot robot
+# modules are imported lazily inside _connect_arms / _record_worker so this module still
+# imports fast on a machine with no arms attached.
+import phone_camera  # noqa: F401 - imported for its .env/.env.local side effect
 
 # --- Configuration (from .env / environment) --------------------------------
 _HERE: Final[Path] = Path(__file__).resolve().parent
@@ -69,20 +72,12 @@ GPU_SSH_HOST: Final[str] = os.environ.get("GPU_SSH_HOST", "")
 CALIB_DIR: Final[Path] = Path(
     os.environ.get("CALIBRATION_DIR") or _HERE / "calibration"
 )
-ARM_CAM_INDEX: Final[str] = os.environ.get("ARM_CAM_INDEX", "")
-ARM_CAM_WIDTH: Final[int] = int(os.environ.get("ARM_CAM_WIDTH", "640"))
-ARM_CAM_HEIGHT: Final[int] = int(os.environ.get("ARM_CAM_HEIGHT", "480"))
-CAM3_INDEX: Final[str] = os.environ.get("CAM3_INDEX", "")
-CAM3_WIDTH: Final[int] = int(os.environ.get("CAM3_WIDTH", "640"))
-CAM3_HEIGHT: Final[int] = int(os.environ.get("CAM3_HEIGHT", "480"))
-# "opencv" (cv2 device index) or "oak" (Luxonis depthai device, e.g. OAK-D Lite).
-CAM3_SOURCE: Final[str] = os.environ.get("CAM3_SOURCE", "opencv").strip().lower()
+# The connected SO101Follower owns the 3 cameras; these are its policy-facing slot names
+# (observation.images.<name>), used to map the preview routes to robot.cameras[<name>].
+PHONE_CAM_NAME: Final[str] = os.environ.get("ROBOT_CAMERA_NAME", "camera1")
+ARM_CAM_NAME: Final[str] = os.environ.get("ARM_CAM_NAME", "camera2")
+CAM3_NAME: Final[str] = os.environ.get("CAM3_NAME", "camera3")
 CLIENT_LOG: Final[Path] = _HERE / "logs" / "client.out"
-# Dataset recording: the recorder subprocess's stdout, the dashboard->recorder command
-# file, and the recorder->dashboard progress file (all under the gitignored logs/ dir).
-RECORD_LOG: Final[Path] = _HERE / "logs" / "record.out"
-RECORD_CTRL: Final[Path] = _HERE / "logs" / "record.ctrl.json"
-RECORD_PROGRESS: Final[Path] = _HERE / "logs" / "record.progress.json"
 # Local LeRobot dataset cache (where record_dataset.py / the Hub store datasets on disk).
 LEROBOT_ROOT: Final[Path] = Path(
     os.environ.get("HF_LEROBOT_HOME")
@@ -117,36 +112,35 @@ _auth_deps: Final[list[Any]] = [Depends(require_auth)] if AUTH_ENABLED else []
 class AppState:
     # lerobot device objects are kept as Any so the dashboard imports without the
     # (heavy) robot modules and runs on a machine with no arms attached.
+    # The connected SO101Follower owns the cameras (robot.cameras[<name>]); previews and
+    # recording both read them via read_latest(), so there's a single device owner.
     robot: Any = None
     teleop: Any = None
     processors: tuple[Any, Any, Any] | None = None
-    camera: Any = None
-    wrist_cam: Any = None
-    cam3: Any = None
     teleop_thread: threading.Thread | None = None
     stop_event: threading.Event = field(default_factory=threading.Event)
     lock: threading.Lock = field(default_factory=threading.Lock)
-    # Serializes wrist-cam read() against release() so freeing it (on inference start)
-    # can't race a concurrent read in the preview generator and segfault OpenCV.
-    wrist_cam_lock: threading.Lock = field(default_factory=threading.Lock)
-    cam3_lock: threading.Lock = field(default_factory=threading.Lock)
-    phone_cam_lock: threading.Lock = field(default_factory=threading.Lock)
     infer_proc: subprocess.Popen[bytes] | None = None
     infer_task: str = DEFAULT_POLICY_TASK
     inference_status: str = "idle"  # idle | running | error
-    # Dataset recording (managed subprocess, mirrors the inference fields above).
-    record_proc: subprocess.Popen[bytes] | None = None
+    # Dataset recording runs in-process in a daemon thread, reusing the connected robot +
+    # leader. The events dict is mutated by the /record/* endpoints (mirrors lerobot's
+    # keyboard events); the worker reports phase/progress through the record_* fields.
+    record_thread: threading.Thread | None = None
+    record_events: dict[str, bool] | None = None
     record_status: RecordStatus = "idle"
     record_repo_id: str | None = None  # repo of the in-flight / just-finished run
     record_last_done_repo: str | None = None  # so the Datasets tab can auto-select it
+    record_current_episode: int = 0
+    record_total_episodes: int = 0
+    record_started_at: float = 0.0  # session start (for the elapsed REC timer)
+    record_phase_started_at: float = 0.0  # current recording/reset window start
+    record_phase_time_s: float = 0.0  # current window's planned duration
     control_fps: float = 0.0
     last_action: dict[str, float] = field(default_factory=dict)
-    phone_fps: float = 0.0
-    phone_fps_at: float = 0.0
-    wrist_fps: float = 0.0
-    wrist_fps_at: float = 0.0
-    cam3_fps: float = 0.0
-    cam3_fps_at: float = 0.0
+    # Per-camera preview FPS keyed by camera name (camera1/camera2/camera3).
+    cam_fps: dict[str, float] = field(default_factory=dict)
+    cam_fps_at: dict[str, float] = field(default_factory=dict)
     error: str | None = None
 
     @property
@@ -168,7 +162,7 @@ class AppState:
 
     @property
     def recording_running(self) -> bool:
-        return self.record_proc is not None and self.record_proc.poll() is None
+        return self.record_thread is not None and self.record_thread.is_alive()
 
 
 state: Final[AppState] = AppState()
@@ -226,10 +220,13 @@ def _connect_no_prompt(dev: Any) -> None:
 
 
 def _connect_arms() -> None:
-    # Imported lazily so the dashboard/camera still run on a machine with no arms.
+    # Imported lazily so the dashboard still imports fast on a machine with no arms.
     from lerobot.processor import make_default_processors
     from lerobot.robots.so_follower import SO101Follower, SO101FollowerConfig
     from lerobot.teleoperators.so_leader import SO101Leader, SO101LeaderConfig
+    from lerobot.utils.import_utils import register_third_party_plugins
+
+    from recording import build_cameras
 
     if not FOLLOWER_PORT or not LEADER_PORT:
         raise RuntimeError(
@@ -237,13 +234,26 @@ def _connect_arms() -> None:
             "Run `uv run lerobot-find-port` to discover them."
         )
 
+    # The follower owns all 3 cameras so previews and in-process recording share one device
+    # owner (build_cameras raises ValueError if a camera isn't configured -> surfaced as 400).
+    register_third_party_plugins()
+    cameras = build_cameras()
     robot = SO101Follower(
         SO101FollowerConfig(
-            port=FOLLOWER_PORT, id=FOLLOWER_ID, calibration_dir=CALIB_DIR
+            port=FOLLOWER_PORT,
+            id=FOLLOWER_ID,
+            calibration_dir=CALIB_DIR,
+            cameras=cameras,
+            use_degrees=True,
         )
     )
     teleop = SO101Leader(
-        SO101LeaderConfig(port=LEADER_PORT, id=LEADER_ID, calibration_dir=CALIB_DIR)
+        SO101LeaderConfig(
+            port=LEADER_PORT,
+            id=LEADER_ID,
+            calibration_dir=CALIB_DIR,
+            use_degrees=True,
+        )
     )
     _connect_no_prompt(robot)
     _connect_no_prompt(teleop)
@@ -261,47 +271,20 @@ def _stop_teleop_thread() -> None:
     state.teleop_thread = None
 
 
-def _release_wrist_cam() -> None:
-    # Hold wrist_cam_lock so we never release while the preview generator is mid-read().
-    with state.wrist_cam_lock:
-        if state.wrist_cam is not None:
-            try:
-                state.wrist_cam.release()
-            except Exception:  # noqa: BLE001 - best-effort
-                pass
-            state.wrist_cam = None
-
-
-def _release_cam3() -> None:
-    with state.cam3_lock:
-        if state.cam3 is not None:
-            try:
-                state.cam3.release()
-            except Exception:  # noqa: BLE001 - best-effort
-                pass
-            state.cam3 = None
-
-
-def _release_camera() -> None:
-    # Phone camera (lerobot OpenCVCamera); disconnect stops its background read thread.
-    with state.phone_cam_lock:
-        if state.camera is not None:
-            try:
-                state.camera.disconnect()
-            except Exception:  # noqa: BLE001 - best-effort
-                pass
-            state.camera = None
-
-
-def _release_all_cameras() -> None:
-    _release_camera()
-    _release_wrist_cam()
-    _release_cam3()
+def _start_teleop_thread() -> None:
+    state.stop_event.clear()
+    state.teleop_thread = threading.Thread(
+        target=_teleop_worker, name="teleop_worker", daemon=True
+    )
+    state.teleop_thread.start()
 
 
 def inference_active() -> bool:
     """True when the model owns the cameras: our own inference subprocess is running,
-    or another process (e.g. an external ``run_robot_client.py``) holds the camera lock."""
+    or another process (e.g. an external ``run_robot_client.py``) holds the camera lock.
+
+    In-process recording does NOT set this — it reuses the connected robot's cameras, so
+    previews stay live during recording."""
     return state.inference_running or camera_lock.active()
 
 
@@ -339,9 +322,9 @@ def _teleop_worker() -> None:
 
 # --- Remote inference (managed subprocess) ----------------------------------
 def _start_inference(task: str) -> None:
-    # Free the hardware so run_robot_client.py can own the arm + all cameras.
+    # Free the hardware so run_robot_client.py can own the arm + all cameras. Disconnecting
+    # the follower also releases its cameras, so the subprocess can re-open the devices.
     _disconnect_arms()
-    _release_all_cameras()
     CLIENT_LOG.parent.mkdir(parents=True, exist_ok=True)
     state.infer_task = task
     state.error = None
@@ -384,7 +367,7 @@ def _refresh_inference_state() -> None:
         state.infer_proc = None
 
 
-# --- Dataset recording (managed subprocess) ---------------------------------
+# --- Dataset recording (in-process, reuses the connected robot + leader) -----
 def _read_json(path: Path) -> dict[str, Any]:
     try:
         return json.loads(path.read_text())
@@ -392,104 +375,118 @@ def _read_json(path: Path) -> dict[str, Any]:
         return {}
 
 
-def _start_recording(
-    name: str, task: str, episodes: int, episode_time: int, reset_time: int, fps: int
+def _set_record_status(status: RecordStatus) -> None:
+    state.record_status = status
+
+
+def _on_record_phase(
+    phase: str, *, current_episode: int, total_episodes: int, phase_time_s: float
 ) -> None:
-    # Free the hardware so record_dataset.py can own the arm + leader + all cameras.
-    _disconnect_arms()
-    _release_all_cameras()
-    RECORD_LOG.parent.mkdir(parents=True, exist_ok=True)
-    # Clear stale control/progress files so a new run starts clean.
-    for p in (RECORD_CTRL, RECORD_PROGRESS):
-        try:
-            p.unlink()
-        except FileNotFoundError:
-            pass
-    state.error = None
-    state.record_status = "starting"
-    state.record_repo_id = None
-    logf = RECORD_LOG.open("wb")
-    state.record_proc = subprocess.Popen(
-        [
-            sys.executable,
-            str(_HERE / "record_dataset.py"),
-            "--name",
-            name,
-            "--task",
-            task,
-            "--episodes",
-            str(episodes),
-            "--episode-time",
-            str(episode_time),
-            "--reset-time",
-            str(reset_time),
-            "--fps",
-            str(fps),
-            "--no-display",
-            "--control-file",
-            str(RECORD_CTRL),
-            "--progress-file",
-            str(RECORD_PROGRESS),
-        ],
-        cwd=str(_HERE),
-        stdout=logf,
-        stderr=subprocess.STDOUT,
-        start_new_session=True,
-        env={**os.environ},
-    )
+    """Callback from run_record_session at the start of each recording / reset window."""
+    if phase in _RECORD_STATUSES:
+        state.record_status = cast(RecordStatus, phase)
+    state.record_current_episode = current_episode
+    state.record_total_episodes = total_episodes
+    state.record_phase_started_at = time.time()
+    state.record_phase_time_s = phase_time_s
 
 
-def _write_record_ctrl(cmd: str) -> None:
-    """Send a command (stop | end_episode | rerecord) to the recorder subprocess."""
+def _record_worker(req: RecordRequest) -> None:
+    """Record a dataset in-process, reusing the already-connected robot + leader.
+
+    Pauses the dashboard's teleop loop (so only record_loop drives the follower), records the
+    requested episodes via the shared session driver, pushes to the Hub, then resumes teleop.
+    """
+    from lerobot.datasets.feature_utils import hw_to_dataset_features
+    from lerobot.datasets.lerobot_dataset import LeRobotDataset
+
+    from recording import resolve_hf_username, run_record_session
+
+    assert state.processors is not None  # guaranteed by the connected-arms precondition
     try:
-        RECORD_CTRL.write_text(json.dumps({"cmd": cmd, "at": time.time()}))
-    except OSError:
-        pass
+        repo_id = f"{resolve_hf_username()}/{req.name}"
+        state.record_repo_id = repo_id
+        # Pause teleop so record_loop is the sole driver of the follower.
+        _stop_teleop_thread()
+
+        action_features = hw_to_dataset_features(state.robot.action_features, "action")  # pyright: ignore[reportArgumentType]
+        obs_features = hw_to_dataset_features(
+            state.robot.observation_features, "observation"
+        )
+        dataset = LeRobotDataset.create(
+            repo_id=repo_id,
+            fps=req.fps,
+            features={**action_features, **obs_features},
+            robot_type=state.robot.name,
+            use_videos=True,
+            image_writer_threads=4,
+        )
+
+        recorded = run_record_session(
+            robot=state.robot,
+            teleop=state.teleop,
+            processors=state.processors,
+            dataset=dataset,
+            episodes=req.episodes,
+            episode_time_s=req.episode_time,
+            reset_time_s=req.reset_time,
+            task=req.task,
+            fps=req.fps,
+            events=state.record_events or {},
+            on_phase=_on_record_phase,
+        )
+
+        _set_record_status("pushing")
+        dataset.push_to_hub(private=True)
+        state.record_current_episode = recorded
+        state.record_last_done_repo = repo_id
+        _set_record_status("done")
+    except Exception as e:  # noqa: BLE001 - surface the failure to the UI
+        state.error = f"recording: {e}"
+        _set_record_status("error")
+    finally:
+        # Resume teleop so the operator can keep moving the arms after a run.
+        if state.connected and not state.teleop_running:
+            _start_teleop_thread()
+
+
+def _start_recording(req: RecordRequest) -> None:
+    state.error = None
+    state.record_events = {
+        "exit_early": False,
+        "rerecord_episode": False,
+        "stop_recording": False,
+    }
+    state.record_repo_id = None
+    state.record_current_episode = 0
+    state.record_total_episodes = req.episodes
+    state.record_started_at = time.time()
+    state.record_phase_started_at = 0.0
+    state.record_phase_time_s = 0.0
+    state.record_status = "starting"
+    state.record_thread = threading.Thread(
+        target=_record_worker, args=(req,), name="record_worker", daemon=True
+    )
+    state.record_thread.start()
 
 
 def _stop_recording() -> None:
-    """Request a *graceful* stop: the recorder finalizes + pushes, then exits.
-
-    Unlike inference, we must NOT SIGKILL on a short deadline — finalize()/push_to_hub()
-    can take tens of seconds. We write the stop command, nudge with SIGTERM (the recorder
-    treats it as a graceful-stop request in control-file mode), and return immediately;
-    _refresh_record_state() reaps the process once it finishes in the background.
-    """
-    proc = state.record_proc
-    if proc is not None and proc.poll() is None:
-        _write_record_ctrl("stop")
-        try:
-            os.killpg(os.getpgid(proc.pid), signal.SIGTERM)
-        except Exception:  # noqa: BLE001 - best-effort backup nudge
-            pass
+    """Ask the in-process recorder to stop after the current frame; it finalizes + pushes."""
+    if state.record_events is not None and state.recording_running:
+        state.record_events["stop_recording"] = True
+        state.record_events["exit_early"] = True
         if state.record_status in ("starting", "recording", "resetting"):
-            state.record_status = "finalizing"
+            _set_record_status("finalizing")
 
 
 def _record_event(event: str) -> None:
-    if event in ("end_episode", "rerecord"):
-        _write_record_ctrl(event)
-
-
-def _refresh_record_state() -> None:
-    """Merge the recorder's progress file into state and reap a finished subprocess."""
-    prog = _read_json(RECORD_PROGRESS)
-    if prog:
-        phase = prog.get("phase")
-        if phase in _RECORD_STATUSES:
-            state.record_status = cast(RecordStatus, phase)
-        state.record_repo_id = prog.get("repo_id") or state.record_repo_id
-    proc = state.record_proc
-    if proc is not None and proc.poll() is not None:
-        clean = proc.returncode in (0, -signal.SIGTERM)
-        if prog.get("phase") == "done" or (clean and state.record_status != "error"):
-            state.record_status = "done"
-            state.record_last_done_repo = state.record_repo_id
-        else:
-            state.record_status = "error"
-            if prog.get("phase") != "error":
-                state.error = f"recorder exited (code {proc.returncode})"
-        state.record_proc = None
+    if state.record_events is None:
+        return
+    if event == "end_episode":
+        state.record_events["exit_early"] = True
+    elif event == "rerecord":
+        state.record_events["rerecord_episode"] = True
+        state.record_events["exit_early"] = True
 
 
 # --- Logs -------------------------------------------------------------------
@@ -570,14 +567,24 @@ def _tick_fps(times: list[float]) -> float:
 _PLACEHOLDER_CACHE: dict[str, bytes] = {}
 
 
-def _placeholder_jpeg(label: str) -> bytes:
-    """Cached gray JPEG shown in a tile while the model owns that camera."""
-    if label not in _PLACEHOLDER_CACHE:
+def _placeholder_jpeg(label: str, reason: str) -> bytes:
+    """Cached gray JPEG shown in a tile when no live frame is available.
+
+    ``reason`` is ``"busy"`` (the model owns the cameras during inference) or
+    ``"disconnected"`` (arms not connected, so the robot doesn't own the cameras)."""
+    key = f"{label}:{reason}"
+    if key not in _PLACEHOLDER_CACHE:
+        headline = "camera in use" if reason == "busy" else "not connected"
+        sub = (
+            f"{label}: held by inference"
+            if reason == "busy"
+            else f"{label}: connect arms to view"
+        )
         img = np.full((480, 640, 3), 38, dtype=np.uint8)
         cv2.putText(
             img,
-            "camera in use",
-            (160, 225),
+            headline,
+            (170, 225),
             cv2.FONT_HERSHEY_SIMPLEX,
             1.1,
             (210, 210, 210),
@@ -586,8 +593,8 @@ def _placeholder_jpeg(label: str) -> bytes:
         )
         cv2.putText(
             img,
-            f"{label}: held by inference or recording",
-            (60, 275),
+            sub,
+            (90, 275),
             cv2.FONT_HERSHEY_SIMPLEX,
             0.65,
             (150, 150, 150),
@@ -595,153 +602,42 @@ def _placeholder_jpeg(label: str) -> bytes:
             cv2.LINE_AA,
         )
         ok, jpg = cv2.imencode(".jpg", img)
-        _PLACEHOLDER_CACHE[label] = jpg.tobytes() if ok else b""
-    return _PLACEHOLDER_CACHE[label]
+        _PLACEHOLDER_CACHE[key] = jpg.tobytes() if ok else b""
+    return _PLACEHOLDER_CACHE[key]
 
 
 def _mjpeg_chunk(jpg: bytes) -> bytes:
     return b"--frame\r\nContent-Type: image/jpeg\r\n\r\n" + jpg + b"\r\n"
 
 
-def _get_camera() -> Any:
-    if inference_active():
-        raise RuntimeError("cameras are owned by the running inference")
-    if state.camera is None:
-        with state.lock:
-            if state.camera is None:
-                state.camera = open_phone_camera()
-    return state.camera
+def _camera_mjpeg(cam_name: str) -> Iterator[bytes]:
+    """Stream one of the connected follower's cameras as MJPEG.
 
-
-def _get_wrist_cam() -> Any:
-    if inference_active():
-        raise RuntimeError("cameras are owned by the running inference")
-    if not ARM_CAM_INDEX:
-        raise RuntimeError("ARM_CAM_INDEX is not set in .env")
-    if state.wrist_cam is None:
-        with state.lock:
-            if state.wrist_cam is None:
-                cap = cv2.VideoCapture(int(ARM_CAM_INDEX))
-                cap.set(cv2.CAP_PROP_FRAME_WIDTH, ARM_CAM_WIDTH)
-                cap.set(cv2.CAP_PROP_FRAME_HEIGHT, ARM_CAM_HEIGHT)
-                if not cap.isOpened():
-                    cap.release()
-                    raise RuntimeError(
-                        f"failed to open wrist camera index {ARM_CAM_INDEX}"
-                    )
-                state.wrist_cam = cap
-    return state.wrist_cam
-
-
-def _open_cam3() -> Any:
-    # OAK-D (depthai) is an XLink device with no OpenCV index, so it needs its own
-    # VideoCapture-like source; otherwise fall back to a plain cv2 device index.
-    if CAM3_SOURCE == "oak":
-        from oak_camera import OakCamera
-
-        cap = OakCamera(width=CAM3_WIDTH, height=CAM3_HEIGHT)
-        if not cap.isOpened():
-            cap.release()
-            raise RuntimeError("failed to open OAK camera (cam3)")
-        return cap
-    if not CAM3_INDEX:
-        raise RuntimeError("CAM3_INDEX is not set in .env")
-    cap = cv2.VideoCapture(int(CAM3_INDEX))
-    cap.set(cv2.CAP_PROP_FRAME_WIDTH, CAM3_WIDTH)
-    cap.set(cv2.CAP_PROP_FRAME_HEIGHT, CAM3_HEIGHT)
-    if not cap.isOpened():
-        cap.release()
-        raise RuntimeError(f"failed to open cam3 index {CAM3_INDEX}")
-    return cap
-
-
-def _get_cam3() -> Any:
-    if inference_active():
-        raise RuntimeError("cameras are owned by the running inference")
-    if state.cam3 is None:
-        with state.lock:
-            if state.cam3 is None:
-                state.cam3 = _open_cam3()
-    return state.cam3
-
-
-def _mjpeg_generator() -> Iterator[bytes]:
+    Reads via ``read_latest()`` — a lock-guarded non-blocking peek — so the preview runs
+    safely *concurrently* with ``record_loop``'s ``get_observation()`` on the same camera
+    (both peek the same buffered frame). Shows a placeholder while the model owns the cameras
+    (inference) or the arms aren't connected; the stream stays open so it resumes live."""
     times: list[float] = []
     while True:
-        # While the model owns the cameras, don't open/read this device — show a
-        # placeholder. The stream stays open so it resumes live when inference ends.
         if inference_active():
-            yield _mjpeg_chunk(_placeholder_jpeg("phone"))
+            yield _mjpeg_chunk(_placeholder_jpeg(cam_name, "busy"))
+            time.sleep(0.3)
+            continue
+        robot = state.robot
+        if robot is None or not state.connected:
+            yield _mjpeg_chunk(_placeholder_jpeg(cam_name, "disconnected"))
             time.sleep(0.3)
             continue
         try:
-            cam = _get_camera()
-            frame_rgb = cam.async_read(timeout_ms=2000)
-        except Exception:  # noqa: BLE001 - skip a dropped frame, keep streaming
+            frame_rgb = robot.cameras[cam_name].read_latest()
+        except Exception:  # noqa: BLE001 - stale/no frame or mid-disconnect; keep streaming
             time.sleep(0.05)
             continue
         ok, jpg = cv2.imencode(".jpg", cv2.cvtColor(frame_rgb, cv2.COLOR_RGB2BGR))
         if not ok:
             continue
-        state.phone_fps, state.phone_fps_at = _tick_fps(times), time.perf_counter()
-        yield _mjpeg_chunk(jpg.tobytes())
-
-
-def _wrist_mjpeg_generator() -> Iterator[bytes]:
-    times: list[float] = []
-    while True:
-        if inference_active():
-            yield _mjpeg_chunk(_placeholder_jpeg("wrist"))
-            time.sleep(0.3)
-            continue
-        # Read under the lock and re-fetch each iteration so a release (by inference or
-        # the watcher) can't race a concurrent read of freed memory.
-        try:
-            _get_wrist_cam()
-        except Exception:  # noqa: BLE001 - camera unavailable; keep the stream alive
-            time.sleep(0.3)
-            continue
-        with state.wrist_cam_lock:
-            cap = state.wrist_cam
-            if cap is None:  # released between _get_wrist_cam and here; retry
-                continue
-            ok, frame = cap.read()  # already BGR
-        if not ok:
-            time.sleep(0.05)
-            continue
-        ok2, jpg = cv2.imencode(".jpg", frame)
-        if not ok2:
-            continue
-        state.wrist_fps, state.wrist_fps_at = _tick_fps(times), time.perf_counter()
-        yield _mjpeg_chunk(jpg.tobytes())
-
-
-def _cam3_mjpeg_generator() -> Iterator[bytes]:
-    times: list[float] = []
-    while True:
-        if inference_active():
-            yield _mjpeg_chunk(_placeholder_jpeg("camera3"))
-            time.sleep(0.3)
-            continue
-        # Read under the lock and re-fetch each iteration so a release (by inference or
-        # the watcher) can't race a concurrent read of freed memory.
-        try:
-            _get_cam3()
-        except Exception:  # noqa: BLE001 - camera unavailable; keep the stream alive
-            time.sleep(0.3)
-            continue
-        with state.cam3_lock:
-            cap = state.cam3
-            if cap is None:  # released between _get_cam3 and here; retry
-                continue
-            ok, frame = cap.read()  # already BGR
-        if not ok:
-            time.sleep(0.05)
-            continue
-        ok2, jpg = cv2.imencode(".jpg", frame)
-        if not ok2:
-            continue
-        state.cam3_fps, state.cam3_fps_at = _tick_fps(times), time.perf_counter()
+        state.cam_fps[cam_name] = _tick_fps(times)
+        state.cam_fps_at[cam_name] = time.perf_counter()
         yield _mjpeg_chunk(jpg.tobytes())
 
 
@@ -756,14 +652,17 @@ def index() -> Any:
     return HTMLResponse(INDEX_HTML)
 
 
+def _cam_fps(name: str) -> float:
+    """Recent preview FPS for a camera (0 if no frame in the last 2s)."""
+    at = state.cam_fps_at.get(name, 0.0)
+    if time.perf_counter() - at >= 2.0:
+        return 0.0
+    return round(state.cam_fps.get(name, 0.0), 1)
+
+
 @app.get("/status")
 def status() -> JSONResponse:
     _refresh_inference_state()
-    _refresh_record_state()
-    now = time.perf_counter()
-    phone = state.phone_fps if now - state.phone_fps_at < 2.0 else 0.0
-    wrist = state.wrist_fps if now - state.wrist_fps_at < 2.0 else 0.0
-    cam3 = state.cam3_fps if now - state.cam3_fps_at < 2.0 else 0.0
     return JSONResponse(
         {
             "connected": state.connected,
@@ -772,9 +671,9 @@ def status() -> JSONResponse:
             "inference_status": state.inference_status,
             "control_fps": state.control_fps,
             "camera_fps": {
-                "phone": round(phone, 1),
-                "wrist": round(wrist, 1),
-                "camera3": round(cam3, 1),
+                "phone": _cam_fps(PHONE_CAM_NAME),
+                "wrist": _cam_fps(ARM_CAM_NAME),
+                "camera3": _cam_fps(CAM3_NAME),
             },
             "joints": state.last_action,
             "error": state.error,
@@ -789,7 +688,11 @@ def status() -> JSONResponse:
             "record_status": state.record_status,
             "record_repo_id": state.record_repo_id,
             "record_last_done_repo": state.record_last_done_repo,
-            "record_progress": _read_json(RECORD_PROGRESS),
+            "record_current_episode": state.record_current_episode,
+            "record_total_episodes": state.record_total_episodes,
+            "record_started_at": state.record_started_at,
+            "record_phase_started_at": state.record_phase_started_at,
+            "record_phase_time_s": state.record_phase_time_s,
         }
     )
 
@@ -838,9 +741,7 @@ def teleop_start() -> dict[str, str]:
         raise HTTPException(status_code=409, detail="Stop recording first.")
     if state.teleop_running:
         return {"status": "already running"}
-    state.stop_event.clear()
-    state.teleop_thread = threading.Thread(target=_teleop_worker, daemon=True)
-    state.teleop_thread.start()
+    _start_teleop_thread()
     return {"status": "teleop started"}
 
 
@@ -871,19 +772,16 @@ def inference_stop() -> dict[str, str]:
     return {"status": "inference stopped"}
 
 
-@app.get("/logs/record")
-def logs_record() -> dict[str, str]:
-    if not RECORD_LOG.is_file():
-        return {"text": "(no recorder log yet)"}
-    return {"text": RECORD_LOG.read_bytes()[-8000:].decode("utf-8", "replace")}
-
-
 @app.post("/record/start")
 def record_start(req: RecordRequest) -> dict[str, str]:
     if state.recording_running:
         return {"status": "already recording"}
     if state.inference_running:
         raise HTTPException(status_code=409, detail="Stop inference first.")
+    if not state.connected:
+        raise HTTPException(
+            status_code=400, detail="Connect the arms (and start teleop) first."
+        )
     if not req.name.strip():
         raise HTTPException(status_code=400, detail="Dataset name is required.")
     if not os.environ.get("HF_TOKEN"):
@@ -891,14 +789,7 @@ def record_start(req: RecordRequest) -> dict[str, str]:
             status_code=400, detail="HF_TOKEN not set in .env.local (needed to push)."
         )
     with state.lock:
-        _start_recording(
-            req.name.strip(),
-            req.task,
-            req.episodes,
-            req.episode_time,
-            req.reset_time,
-            req.fps,
-        )
+        _start_recording(req.model_copy(update={"name": req.name.strip()}))
     return {"status": "recording starting", "name": req.name.strip()}
 
 
@@ -1015,43 +906,25 @@ def dataset_verify(repo_id: str) -> dict[str, Any]:
     return {"local": local, "hub": hub, "match": match}
 
 
-# During inference the model owns the cameras: skip the pre-open probe so the stream
-# starts and shows the placeholder instead of a 503. When not locked, keep the probe so
-# a genuinely missing/broken camera still surfaces as 503.
+# The previews stream from the connected follower's cameras (camera1/2/3). They always
+# return 200 and show a placeholder when the arms aren't connected or the model owns the
+# cameras, so the tile resumes live without a reload once those clear.
+_MJPEG: Final[str] = "multipart/x-mixed-replace; boundary=frame"
+
+
 @app.get("/camera.mjpeg")
 def camera() -> StreamingResponse:
-    if not inference_active():
-        try:
-            _get_camera()
-        except Exception as e:  # noqa: BLE001
-            raise HTTPException(status_code=503, detail=f"camera: {e}") from e
-    return StreamingResponse(
-        _mjpeg_generator(), media_type="multipart/x-mixed-replace; boundary=frame"
-    )
+    return StreamingResponse(_camera_mjpeg(PHONE_CAM_NAME), media_type=_MJPEG)
 
 
 @app.get("/wrist.mjpeg")
 def wrist_camera() -> StreamingResponse:
-    if not inference_active():
-        try:
-            _get_wrist_cam()
-        except Exception as e:  # noqa: BLE001
-            raise HTTPException(status_code=503, detail=f"wrist camera: {e}") from e
-    return StreamingResponse(
-        _wrist_mjpeg_generator(), media_type="multipart/x-mixed-replace; boundary=frame"
-    )
+    return StreamingResponse(_camera_mjpeg(ARM_CAM_NAME), media_type=_MJPEG)
 
 
 @app.get("/camera3.mjpeg")
 def camera3_camera() -> StreamingResponse:
-    if not inference_active():
-        try:
-            _get_cam3()
-        except Exception as e:  # noqa: BLE001
-            raise HTTPException(status_code=503, detail=f"cam3: {e}") from e
-    return StreamingResponse(
-        _cam3_mjpeg_generator(), media_type="multipart/x-mixed-replace; boundary=frame"
-    )
+    return StreamingResponse(_camera_mjpeg(CAM3_NAME), media_type=_MJPEG)
 
 
 INDEX_HTML: Final[str] = """<!doctype html>
@@ -1184,20 +1057,5 @@ if (DIST / "assets").is_dir():
     app.mount("/assets", StaticFiles(directory=DIST / "assets"), name="assets")
 
 
-def _camera_lock_watcher() -> None:
-    """Release all cameras the moment the model takes the lock, so it always wins —
-    even tiles no browser is viewing (whose cameras would otherwise stay cached-open)."""
-    was_active = False
-    while True:
-        active = inference_active()
-        if active and not was_active:
-            _release_all_cameras()
-        was_active = active
-        time.sleep(0.25)
-
-
 if __name__ == "__main__":
-    threading.Thread(
-        target=_camera_lock_watcher, name="camera_lock_watcher", daemon=True
-    ).start()
     uvicorn.run(app, host="0.0.0.0", port=DASHBOARD_PORT)
