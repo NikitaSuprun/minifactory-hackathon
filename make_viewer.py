@@ -22,6 +22,65 @@ import pyarrow.parquet as pq
 DEFAULT_ROOT = Path(os.path.expanduser("~/.cache/huggingface/lerobot"))
 
 
+def build_viewer_html(
+    repo_id: str,
+    episode_index: int = 0,
+    root: Path = DEFAULT_ROOT,
+    video_url_prefix: str | None = None,
+) -> str:
+    """Return a self-contained HTML viewer for one episode of a local LeRobotDataset.
+
+    ``video_url_prefix`` makes the ``<video>`` ``src`` absolute (e.g. when the dashboard
+    serves the mp4s from a route); left ``None`` the paths stay relative to the dataset
+    dir, which is what the standalone ``viewer.html`` next to the data needs.
+    """
+    ds_dir = root / repo_id
+    info = json.loads((ds_dir / "meta" / "info.json").read_text())
+    fps = info["fps"]
+
+    # Camera (video) feature keys, e.g. observation.images.camera1
+    video_keys = [k for k, v in info["features"].items() if v.get("dtype") == "video"]
+
+    # Load the episode's rows from the single data parquet (this dataset has one chunk).
+    data_file = ds_dir / "data" / "chunk-000" / "file-000.parquet"
+    table = pq.read_table(data_file)
+    df = table.to_pylist()
+    rows = [r for r in df if r["episode_index"] == episode_index]
+    rows.sort(key=lambda r: r["frame_index"])
+    if not rows:
+        raise ValueError(f"No frames found for episode {episode_index}")
+
+    action_names = info["features"]["action"]["names"]
+    state_names = info["features"]["observation.state"]["names"]
+    timestamps = [r["timestamp"] for r in rows]
+    actions = [list(r["action"]) for r in rows]
+    states = [list(r["observation.state"]) for r in rows]
+
+    # Resolve video file paths relative to where the HTML will live (ds_dir).
+    videos = []
+    for vk in video_keys:
+        rel = info["video_path"].format(video_key=vk, chunk_index=0, file_index=0)
+        if (ds_dir / rel).exists():
+            src = rel if video_url_prefix is None else f"{video_url_prefix}/{rel}"
+            videos.append({"key": vk, "src": src})
+
+    payload = {
+        "repo_id": repo_id,
+        "episode": episode_index,
+        "fps": fps,
+        "num_frames": len(rows),
+        "duration": timestamps[-1] if timestamps else 0,
+        "videos": videos,
+        "action_names": action_names,
+        "state_names": state_names,
+        "timestamps": timestamps,
+        "actions": actions,
+        "states": states,
+    }
+
+    return _HTML_TEMPLATE.replace("__DATA__", json.dumps(payload))
+
+
 def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("--repo-id", required=True)
@@ -35,51 +94,11 @@ def main() -> None:
     args = ap.parse_args()
 
     root = args.root or DEFAULT_ROOT
-    ds_dir = root / args.repo_id
-    info = json.loads((ds_dir / "meta" / "info.json").read_text())
-    fps = info["fps"]
-
-    # Camera (video) feature keys, e.g. observation.images.camera1
-    video_keys = [k for k, v in info["features"].items() if v.get("dtype") == "video"]
-
-    # Load the episode's rows from the single data parquet (this dataset has one chunk).
-    data_file = ds_dir / "data" / "chunk-000" / "file-000.parquet"
-    table = pq.read_table(data_file)
-    df = table.to_pylist()
-    rows = [r for r in df if r["episode_index"] == args.episode_index]
-    rows.sort(key=lambda r: r["frame_index"])
-    if not rows:
-        raise SystemExit(f"No frames found for episode {args.episode_index}")
-
-    action_names = info["features"]["action"]["names"]
-    state_names = info["features"]["observation.state"]["names"]
-    timestamps = [r["timestamp"] for r in rows]
-    actions = [list(r["action"]) for r in rows]
-    states = [list(r["observation.state"]) for r in rows]
-
-    # Resolve video file paths relative to where the HTML will live (ds_dir).
-    videos = []
-    for vk in video_keys:
-        rel = info["video_path"].format(video_key=vk, chunk_index=0, file_index=0)
-        if (ds_dir / rel).exists():
-            videos.append({"key": vk, "src": rel})
-
-    payload = {
-        "repo_id": args.repo_id,
-        "episode": args.episode_index,
-        "fps": fps,
-        "num_frames": len(rows),
-        "duration": timestamps[-1] if timestamps else 0,
-        "videos": videos,
-        "action_names": action_names,
-        "state_names": state_names,
-        "timestamps": timestamps,
-        "actions": actions,
-        "states": states,
-    }
-
-    html = _HTML_TEMPLATE.replace("__DATA__", json.dumps(payload))
-    out = ds_dir / "viewer.html"
+    try:
+        html = build_viewer_html(args.repo_id, args.episode_index, root)
+    except ValueError as e:
+        raise SystemExit(str(e))
+    out = root / args.repo_id / "viewer.html"
     out.write_text(html)
     print(f"Viewer written -> {out}")
     print(f"Open it with:   open '{out}'")

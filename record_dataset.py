@@ -28,9 +28,11 @@ from __future__ import annotations
 
 import argparse
 import atexit
+import json
 import os
 import signal
 import sys
+import threading
 import time
 from pathlib import Path
 from typing import Any, Callable, Final, TypeVar
@@ -99,10 +101,53 @@ CAMERA_LOCK_GRACE_S: Final[float] = 2.0
 
 T = TypeVar("T")
 
+# Set to the live ``events`` dict only in dashboard/control-file mode (see main). When set,
+# SIGTERM requests a graceful stop (finalize + push) instead of a hard exit.
+_events_ref: dict[str, bool] | None = None
+
 
 def _release_and_exit(signum: int, frame: Any) -> None:
+    # Dashboard mode: ask the record loop to stop cleanly so ``finally`` still
+    # finalizes + pushes; the lock is released by the registered atexit handler.
+    if _events_ref is not None:
+        _events_ref["stop_recording"] = True
+        _events_ref["exit_early"] = True
+        return
+    # Terminal mode: legacy behavior — drop the lock and exit immediately.
     camera_lock.release()
     sys.exit(0)
+
+
+def _start_control_thread(path: Path, events: dict[str, bool]) -> None:
+    """Poll a JSON control file and flip the shared ``events`` flags.
+
+    Replaces lerobot's keyboard listener when launched headless from the dashboard:
+    ``record_loop`` reads the very same ``events`` dict by reference, so mutating it
+    here is equivalent to a key press. Mapping mirrors the keyboard exactly —
+    ``stop`` = Esc, ``end_episode`` = ->, ``rerecord`` = <-.
+    """
+
+    def run() -> None:
+        last_at = 0.0
+        while not events["stop_recording"]:
+            try:
+                cmd = json.loads(path.read_text())
+            except (FileNotFoundError, ValueError, OSError):
+                cmd = None
+            if cmd and float(cmd.get("at", 0)) > last_at:
+                last_at = float(cmd["at"])
+                c = cmd.get("cmd")
+                if c == "stop":
+                    events["stop_recording"] = True
+                    events["exit_early"] = True
+                elif c == "end_episode":
+                    events["exit_early"] = True
+                elif c == "rerecord":
+                    events["rerecord_episode"] = True
+                    events["exit_early"] = True
+            time.sleep(0.2)
+
+    threading.Thread(target=run, name="record_control", daemon=True).start()
 
 
 def _prompt(label: str, default: T, cast: Callable[[str], T] = str) -> T:
@@ -206,7 +251,34 @@ def main() -> None:
         action="store_true",
         help="Don't open the rerun viewer (headless / faster).",
     )
+    parser.add_argument(
+        "--control-file",
+        help="Headless dashboard mode: poll this JSON file for stop/end/rerecord "
+        "commands instead of the keyboard listener.",
+    )
+    parser.add_argument(
+        "--progress-file",
+        help="Write phase/progress JSON here for the dashboard to display.",
+    )
     args = parser.parse_args()
+
+    control_path = Path(args.control_file) if args.control_file else None
+    progress_path = Path(args.progress_file) if args.progress_file else None
+
+    def progress(phase: str, **kw: Any) -> None:
+        """Write the current recording phase for the dashboard (no-op without --progress-file)."""
+        if progress_path is None:
+            return
+        payload = {
+            "phase": phase,
+            "repo_id": repo_id,
+            "total_episodes": num_episodes,
+            **kw,
+        }
+        try:
+            progress_path.write_text(json.dumps(payload))
+        except OSError:
+            pass
 
     if not FOLLOWER_PORT:
         sys.exit("FOLLOWER_PORT is not set in .env (run `uv run lerobot-find-port`).")
@@ -288,7 +360,21 @@ def main() -> None:
         make_default_processors()
     )
 
-    listener, events = init_keyboard_listener()
+    if control_path is not None:
+        # Dashboard mode: no keyboard/terminal, no rerun window. Build the events dict
+        # ourselves and drive it from the control file; SIGTERM stops gracefully.
+        global _events_ref
+        listener = None
+        events = {
+            "exit_early": False,
+            "rerecord_episode": False,
+            "stop_recording": False,
+        }
+        _events_ref = events
+        _start_control_thread(control_path, events)
+        display = False
+    else:
+        listener, events = init_keyboard_listener()
     if display:
         init_rerun(session_name="recording")
 
@@ -297,9 +383,16 @@ def main() -> None:
 
     recorded_episodes = 0
     try:
+        progress("starting")
         with VideoEncodingManager(dataset):
             while recorded_episodes < num_episodes and not events["stop_recording"]:
                 log_say(f"Recording episode {recorded_episodes + 1} of {num_episodes}")
+                progress(
+                    "recording",
+                    current_episode=recorded_episodes + 1,
+                    episode_started_at=time.time(),
+                    episode_time_s=episode_time_s,
+                )
                 record_loop(
                     robot=robot,
                     events=events,
@@ -320,6 +413,12 @@ def main() -> None:
                     (recorded_episodes < num_episodes - 1) or events["rerecord_episode"]
                 ):
                     log_say("Reset the environment")
+                    progress(
+                        "resetting",
+                        current_episode=recorded_episodes + 1,
+                        episode_started_at=time.time(),
+                        episode_time_s=reset_time_s,
+                    )
                     record_loop(
                         robot=robot,
                         events=events,
@@ -342,8 +441,12 @@ def main() -> None:
 
                 dataset.save_episode()
                 recorded_episodes += 1
+    except Exception as e:  # noqa: BLE001 - surface the failure to the dashboard
+        progress("error", message=str(e))
+        raise
     finally:
         log_say("Stop recording", blocking=True)
+        progress("finalizing", current_episode=recorded_episodes)
         dataset.finalize()
         if robot.is_connected:
             robot.disconnect()
@@ -352,9 +455,12 @@ def main() -> None:
         if listener is not None:
             listener.stop()
 
+        url = f"https://huggingface.co/datasets/{repo_id}"
         log_say(f"Pushing {recorded_episodes} episode(s) to {repo_id}")
+        progress("pushing", current_episode=recorded_episodes)
         dataset.push_to_hub(private=True)
-        print(f"\nDone. Dataset at https://huggingface.co/datasets/{repo_id}")
+        progress("done", current_episode=recorded_episodes, message=url)
+        print(f"\nDone. Dataset at {url}")
 
 
 if __name__ == "__main__":

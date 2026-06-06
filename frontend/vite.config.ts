@@ -12,6 +12,8 @@ const apiPaths = [
   "/disconnect",
   "/teleop",
   "/inference",
+  "/record",
+  "/datasets",
   "/camera.mjpeg",
   "/wrist.mjpeg",
   "/camera3.mjpeg",

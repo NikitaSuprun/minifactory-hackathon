@@ -18,6 +18,7 @@ Config from .env (ports, calibration, server address); HF token from .env.local.
 
 from __future__ import annotations
 
+import json
 import os
 import secrets
 import signal
@@ -29,7 +30,7 @@ import time
 from collections.abc import Iterator
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Final
+from typing import Any, Final, Literal, cast, get_args
 
 import cv2
 import numpy as np
@@ -77,6 +78,16 @@ CAM3_HEIGHT: Final[int] = int(os.environ.get("CAM3_HEIGHT", "480"))
 # "opencv" (cv2 device index) or "oak" (Luxonis depthai device, e.g. OAK-D Lite).
 CAM3_SOURCE: Final[str] = os.environ.get("CAM3_SOURCE", "opencv").strip().lower()
 CLIENT_LOG: Final[Path] = _HERE / "logs" / "client.out"
+# Dataset recording: the recorder subprocess's stdout, the dashboard->recorder command
+# file, and the recorder->dashboard progress file (all under the gitignored logs/ dir).
+RECORD_LOG: Final[Path] = _HERE / "logs" / "record.out"
+RECORD_CTRL: Final[Path] = _HERE / "logs" / "record.ctrl.json"
+RECORD_PROGRESS: Final[Path] = _HERE / "logs" / "record.progress.json"
+# Local LeRobot dataset cache (where record_dataset.py / the Hub store datasets on disk).
+LEROBOT_ROOT: Final[Path] = Path(
+    os.environ.get("HF_LEROBOT_HOME")
+    or Path(os.environ.get("HF_HOME", "~/.cache/huggingface")) / "lerobot"
+).expanduser()
 SERVER_LOG_REMOTE: Final[str] = "~/minifactory-hackathon/policy_server.out"
 # Built Vite SPA (committed). Served when present; otherwise the inline HTML below.
 DIST: Final[Path] = _HERE / "frontend" / "dist"
@@ -123,6 +134,11 @@ class AppState:
     infer_proc: subprocess.Popen[bytes] | None = None
     infer_task: str = DEFAULT_POLICY_TASK
     inference_status: str = "idle"  # idle | running | error
+    # Dataset recording (managed subprocess, mirrors the inference fields above).
+    record_proc: subprocess.Popen[bytes] | None = None
+    record_status: RecordStatus = "idle"
+    record_repo_id: str | None = None  # repo of the in-flight / just-finished run
+    record_last_done_repo: str | None = None  # so the Datasets tab can auto-select it
     control_fps: float = 0.0
     last_action: dict[str, float] = field(default_factory=dict)
     phone_fps: float = 0.0
@@ -150,6 +166,10 @@ class AppState:
     def inference_running(self) -> bool:
         return self.infer_proc is not None and self.infer_proc.poll() is None
 
+    @property
+    def recording_running(self) -> bool:
+        return self.record_proc is not None and self.record_proc.poll() is None
+
 
 state: Final[AppState] = AppState()
 app: Final[FastAPI] = FastAPI(title="SO-101 Arm Dashboard", dependencies=_auth_deps)
@@ -157,8 +177,34 @@ if not AUTH_ENABLED:
     print("WARNING: DASHBOARD_PASS not set in .env -> dashboard is UNAUTHENTICATED.")
 
 
+RecordStatus = Literal[
+    "idle",
+    "starting",
+    "recording",
+    "resetting",
+    "finalizing",
+    "pushing",
+    "done",
+    "error",
+]
+_RECORD_STATUSES: Final[frozenset[str]] = frozenset(get_args(RecordStatus))
+
+
 class InferenceRequest(BaseModel):
     task: str = DEFAULT_POLICY_TASK
+
+
+class RecordRequest(BaseModel):
+    name: str
+    task: str = DEFAULT_POLICY_TASK
+    episodes: int = 5
+    episode_time: int = 60
+    reset_time: int = 15
+    fps: int = 30
+
+
+class RecordEventRequest(BaseModel):
+    event: Literal["end_episode", "rerecord"]
 
 
 # --- Arm control ------------------------------------------------------------
@@ -338,6 +384,114 @@ def _refresh_inference_state() -> None:
         state.infer_proc = None
 
 
+# --- Dataset recording (managed subprocess) ---------------------------------
+def _read_json(path: Path) -> dict[str, Any]:
+    try:
+        return json.loads(path.read_text())
+    except (FileNotFoundError, ValueError, OSError):
+        return {}
+
+
+def _start_recording(
+    name: str, task: str, episodes: int, episode_time: int, reset_time: int, fps: int
+) -> None:
+    # Free the hardware so record_dataset.py can own the arm + leader + all cameras.
+    _disconnect_arms()
+    _release_all_cameras()
+    RECORD_LOG.parent.mkdir(parents=True, exist_ok=True)
+    # Clear stale control/progress files so a new run starts clean.
+    for p in (RECORD_CTRL, RECORD_PROGRESS):
+        try:
+            p.unlink()
+        except FileNotFoundError:
+            pass
+    state.error = None
+    state.record_status = "starting"
+    state.record_repo_id = None
+    logf = RECORD_LOG.open("wb")
+    state.record_proc = subprocess.Popen(
+        [
+            sys.executable,
+            str(_HERE / "record_dataset.py"),
+            "--name",
+            name,
+            "--task",
+            task,
+            "--episodes",
+            str(episodes),
+            "--episode-time",
+            str(episode_time),
+            "--reset-time",
+            str(reset_time),
+            "--fps",
+            str(fps),
+            "--no-display",
+            "--control-file",
+            str(RECORD_CTRL),
+            "--progress-file",
+            str(RECORD_PROGRESS),
+        ],
+        cwd=str(_HERE),
+        stdout=logf,
+        stderr=subprocess.STDOUT,
+        start_new_session=True,
+        env={**os.environ},
+    )
+
+
+def _write_record_ctrl(cmd: str) -> None:
+    """Send a command (stop | end_episode | rerecord) to the recorder subprocess."""
+    try:
+        RECORD_CTRL.write_text(json.dumps({"cmd": cmd, "at": time.time()}))
+    except OSError:
+        pass
+
+
+def _stop_recording() -> None:
+    """Request a *graceful* stop: the recorder finalizes + pushes, then exits.
+
+    Unlike inference, we must NOT SIGKILL on a short deadline — finalize()/push_to_hub()
+    can take tens of seconds. We write the stop command, nudge with SIGTERM (the recorder
+    treats it as a graceful-stop request in control-file mode), and return immediately;
+    _refresh_record_state() reaps the process once it finishes in the background.
+    """
+    proc = state.record_proc
+    if proc is not None and proc.poll() is None:
+        _write_record_ctrl("stop")
+        try:
+            os.killpg(os.getpgid(proc.pid), signal.SIGTERM)
+        except Exception:  # noqa: BLE001 - best-effort backup nudge
+            pass
+        if state.record_status in ("starting", "recording", "resetting"):
+            state.record_status = "finalizing"
+
+
+def _record_event(event: str) -> None:
+    if event in ("end_episode", "rerecord"):
+        _write_record_ctrl(event)
+
+
+def _refresh_record_state() -> None:
+    """Merge the recorder's progress file into state and reap a finished subprocess."""
+    prog = _read_json(RECORD_PROGRESS)
+    if prog:
+        phase = prog.get("phase")
+        if phase in _RECORD_STATUSES:
+            state.record_status = cast(RecordStatus, phase)
+        state.record_repo_id = prog.get("repo_id") or state.record_repo_id
+    proc = state.record_proc
+    if proc is not None and proc.poll() is not None:
+        clean = proc.returncode in (0, -signal.SIGTERM)
+        if prog.get("phase") == "done" or (clean and state.record_status != "error"):
+            state.record_status = "done"
+            state.record_last_done_repo = state.record_repo_id
+        else:
+            state.record_status = "error"
+            if prog.get("phase") != "error":
+                state.error = f"recorder exited (code {proc.returncode})"
+        state.record_proc = None
+
+
 # --- Logs -------------------------------------------------------------------
 _srv_log_text: str = ""
 _srv_log_at: float = 0.0
@@ -422,8 +576,8 @@ def _placeholder_jpeg(label: str) -> bytes:
         img = np.full((480, 640, 3), 38, dtype=np.uint8)
         cv2.putText(
             img,
-            "inference running",
-            (120, 225),
+            "camera in use",
+            (160, 225),
             cv2.FONT_HERSHEY_SIMPLEX,
             1.1,
             (210, 210, 210),
@@ -432,8 +586,8 @@ def _placeholder_jpeg(label: str) -> bytes:
         )
         cv2.putText(
             img,
-            f"{label}: camera in use by the model",
-            (70, 275),
+            f"{label}: held by inference or recording",
+            (60, 275),
             cv2.FONT_HERSHEY_SIMPLEX,
             0.65,
             (150, 150, 150),
@@ -605,6 +759,7 @@ def index() -> Any:
 @app.get("/status")
 def status() -> JSONResponse:
     _refresh_inference_state()
+    _refresh_record_state()
     now = time.perf_counter()
     phone = state.phone_fps if now - state.phone_fps_at < 2.0 else 0.0
     wrist = state.wrist_fps if now - state.wrist_fps_at < 2.0 else 0.0
@@ -630,6 +785,11 @@ def status() -> JSONResponse:
             "server_reachable": _server_reachable(),
             "follower_port": FOLLOWER_PORT or None,
             "leader_port": LEADER_PORT or None,
+            "recording_running": state.recording_running,
+            "record_status": state.record_status,
+            "record_repo_id": state.record_repo_id,
+            "record_last_done_repo": state.record_last_done_repo,
+            "record_progress": _read_json(RECORD_PROGRESS),
         }
     )
 
@@ -648,6 +808,8 @@ def logs_client() -> dict[str, str]:
 def connect() -> dict[str, str]:
     if state.inference_running:
         raise HTTPException(status_code=409, detail="Stop inference first.")
+    if state.recording_running:
+        raise HTTPException(status_code=409, detail="Stop recording first.")
     with state.lock:
         if state.connected:
             return {"status": "already connected"}
@@ -672,6 +834,8 @@ def teleop_start() -> dict[str, str]:
         raise HTTPException(status_code=400, detail="Connect the arms first.")
     if state.inference_running:
         raise HTTPException(status_code=409, detail="Stop inference first.")
+    if state.recording_running:
+        raise HTTPException(status_code=409, detail="Stop recording first.")
     if state.teleop_running:
         return {"status": "already running"}
     state.stop_event.clear()
@@ -690,6 +854,8 @@ def teleop_stop() -> dict[str, str]:
 def inference_start(req: InferenceRequest) -> dict[str, str]:
     if state.inference_running:
         return {"status": "already running"}
+    if state.recording_running:
+        raise HTTPException(status_code=409, detail="Stop recording first.")
     if not POLICY_SERVER_ADDRESS:
         raise HTTPException(
             status_code=400, detail="POLICY_SERVER_ADDRESS not set in .env."
@@ -703,6 +869,150 @@ def inference_start(req: InferenceRequest) -> dict[str, str]:
 def inference_stop() -> dict[str, str]:
     _stop_inference()
     return {"status": "inference stopped"}
+
+
+@app.get("/logs/record")
+def logs_record() -> dict[str, str]:
+    if not RECORD_LOG.is_file():
+        return {"text": "(no recorder log yet)"}
+    return {"text": RECORD_LOG.read_bytes()[-8000:].decode("utf-8", "replace")}
+
+
+@app.post("/record/start")
+def record_start(req: RecordRequest) -> dict[str, str]:
+    if state.recording_running:
+        return {"status": "already recording"}
+    if state.inference_running:
+        raise HTTPException(status_code=409, detail="Stop inference first.")
+    if not req.name.strip():
+        raise HTTPException(status_code=400, detail="Dataset name is required.")
+    if not os.environ.get("HF_TOKEN"):
+        raise HTTPException(
+            status_code=400, detail="HF_TOKEN not set in .env.local (needed to push)."
+        )
+    with state.lock:
+        _start_recording(
+            req.name.strip(),
+            req.task,
+            req.episodes,
+            req.episode_time,
+            req.reset_time,
+            req.fps,
+        )
+    return {"status": "recording starting", "name": req.name.strip()}
+
+
+@app.post("/record/stop")
+def record_stop() -> dict[str, str]:
+    _stop_recording()
+    return {"status": "stopping"}
+
+
+@app.post("/record/event")
+def record_event(req: RecordEventRequest) -> dict[str, str]:
+    if not state.recording_running:
+        raise HTTPException(status_code=409, detail="Not recording.")
+    _record_event(req.event)
+    return {"status": "ok", "event": req.event}
+
+
+# --- Datasets (record output: list, replay viewer, upload verification) ------
+def _scan_datasets() -> list[dict[str, Any]]:
+    """List local LeRobot datasets under the cache root ({user}/{name}/meta/info.json)."""
+    out: list[dict[str, Any]] = []
+    if not LEROBOT_ROOT.is_dir():
+        return out
+    for info_path in LEROBOT_ROOT.glob("*/*/meta/info.json"):
+        ds_dir = info_path.parent.parent
+        repo_id = str(ds_dir.relative_to(LEROBOT_ROOT))
+        info = _read_json(info_path)
+        if not info:
+            continue
+        cams = [
+            k.split(".")[-1]
+            for k, v in info.get("features", {}).items()
+            if isinstance(v, dict) and v.get("dtype") == "video"
+        ]
+        out.append(
+            {
+                "repo_id": repo_id,
+                "total_episodes": info.get("total_episodes", 0),
+                "total_frames": info.get("total_frames", 0),
+                "fps": info.get("fps", 0),
+                "cameras": cams,
+            }
+        )
+    out.sort(key=lambda d: d["repo_id"])
+    return out
+
+
+@app.get("/datasets")
+def datasets() -> dict[str, list[dict[str, Any]]]:
+    return {"datasets": _scan_datasets()}
+
+
+@app.get("/datasets/{repo_id:path}/viewer", response_class=HTMLResponse)
+def dataset_viewer(repo_id: str, episode: int = 0) -> Any:
+    from make_viewer import build_viewer_html
+
+    try:
+        html = build_viewer_html(
+            repo_id,
+            episode,
+            root=LEROBOT_ROOT,
+            video_url_prefix=f"/datasets/{repo_id}/file",
+        )
+    except Exception as e:  # noqa: BLE001 - missing dataset/episode -> 404
+        raise HTTPException(
+            status_code=404, detail=f"dataset/episode not found: {e}"
+        ) from e
+    return HTMLResponse(html)
+
+
+@app.get("/datasets/{repo_id:path}/file/{relpath:path}")
+def dataset_file(repo_id: str, relpath: str) -> FileResponse:
+    base = (LEROBOT_ROOT / repo_id).resolve()
+    target = (base / relpath).resolve()
+    # Path-traversal guard: target must stay inside the dataset dir.
+    if base != target and base not in target.parents:
+        raise HTTPException(status_code=403, detail="forbidden")
+    if not target.is_file():
+        raise HTTPException(status_code=404, detail="not found")
+    return FileResponse(
+        target
+    )  # FileResponse handles Range requests for <video> seeking
+
+
+@app.get("/datasets/{repo_id:path}/verify")
+def dataset_verify(repo_id: str) -> dict[str, Any]:
+    """Compare the local dataset against its Hugging Face Hub repo to confirm the upload."""
+    ds_dir = LEROBOT_ROOT / repo_id
+    info = _read_json(ds_dir / "meta" / "info.json")
+    if not info:
+        raise HTTPException(status_code=404, detail="dataset not found")
+    local = {
+        "total_episodes": info.get("total_episodes", 0),
+        "total_frames": info.get("total_frames", 0),
+        "video_files": sum(1 for _ in (ds_dir / "videos").rglob("*.mp4")),
+    }
+    try:
+        from huggingface_hub import HfApi
+
+        api = HfApi(token=os.environ.get("HF_TOKEN"))
+        files = list(api.list_repo_files(repo_id, repo_type="dataset"))
+        hub = {
+            "exists": True,
+            "video_files": sum(1 for f in files if f.endswith(".mp4")),
+            "has_info": any(f.endswith("meta/info.json") for f in files),
+        }
+        match = bool(hub["has_info"] and hub["video_files"] == local["video_files"])
+    except Exception as e:  # noqa: BLE001 - repo missing / offline / no token
+        return {
+            "local": local,
+            "hub": {"exists": False, "error": str(e)},
+            "match": False,
+        }
+    return {"local": local, "hub": hub, "match": match}
 
 
 # During inference the model owns the cameras: skip the pre-open probe so the stream

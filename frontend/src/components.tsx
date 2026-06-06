@@ -193,6 +193,22 @@ export function StatusPills({ s }: { s: Status }) {
       >
         inference {s.inference_status}
       </Pill>
+      {s.record_status !== "idle" && (
+        <Pill
+          tone={
+            s.record_status === "error"
+              ? "err"
+              : s.record_status === "done"
+                ? "on"
+                : s.recording_running
+                  ? "warn"
+                  : "off"
+          }
+          pulse={s.recording_running}
+        >
+          recording {s.record_status}
+        </Pill>
+      )}
       <Pill tone={s.server_reachable ? "on" : "err"}>
         server {s.server_reachable ? "reachable" : "down"}
       </Pill>
