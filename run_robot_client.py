@@ -20,9 +20,15 @@ from __future__ import annotations
 import json
 import os
 import sys
+from pathlib import Path
 from typing import Final
 
 from phone_camera import resolve_phone_url
+
+_HERE: Final[Path] = Path(__file__).resolve().parent
+CALIBRATION_DIR: Final[str] = os.environ.get("CALIBRATION_DIR") or str(
+    _HERE / "calibration"
+)
 
 FOLLOWER_PORT: Final[str] = os.environ.get("FOLLOWER_PORT", "")
 ROBOT_ID: Final[str] = os.environ.get("ROBOT_ID", "so101_follower")
@@ -55,6 +61,7 @@ def main() -> None:
         "--robot.type=so101_follower",
         f"--robot.port={FOLLOWER_PORT}",
         f"--robot.id={ROBOT_ID}",
+        f"--robot.calibration_dir={CALIBRATION_DIR}",
         f"--robot.cameras={json.dumps(cameras)}",
         f"--task={POLICY_TASK}",
         f"--server_address={SERVER_ADDRESS}",

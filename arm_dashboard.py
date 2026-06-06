@@ -28,6 +28,7 @@ import threading
 import time
 from collections.abc import Iterator
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Any, Final
 
 import cv2
@@ -53,6 +54,10 @@ DASHBOARD_PASS: Final[str] = os.environ.get("DASHBOARD_PASS", "")
 DEFAULT_POLICY_PATH: Final[str] = os.environ.get("POLICY_PATH", "lerobot/smolvla_base")
 DEFAULT_POLICY_TASK: Final[str] = os.environ.get("POLICY_TASK", "Pick up the cube")
 DEFAULT_POLICY_DEVICE: Final[str] = os.environ.get("POLICY_DEVICE", "")
+# Repo-committed calibration (calibration/<id>.json), used for both arms.
+CALIB_DIR: Final[Path] = Path(
+    os.environ.get("CALIBRATION_DIR") or Path(__file__).resolve().parent / "calibration"
+)
 
 
 # --- Authentication ---------------------------------------------------------
@@ -139,8 +144,14 @@ def _connect_arms() -> None:
             "Run `uv run lerobot-find-port` to discover them."
         )
 
-    robot = SO101Follower(SO101FollowerConfig(port=FOLLOWER_PORT, id=FOLLOWER_ID))
-    teleop = SO101Leader(SO101LeaderConfig(port=LEADER_PORT, id=LEADER_ID))
+    robot = SO101Follower(
+        SO101FollowerConfig(
+            port=FOLLOWER_PORT, id=FOLLOWER_ID, calibration_dir=CALIB_DIR
+        )
+    )
+    teleop = SO101Leader(
+        SO101LeaderConfig(port=LEADER_PORT, id=LEADER_ID, calibration_dir=CALIB_DIR)
+    )
     robot.connect()
     teleop.connect()
 

@@ -119,6 +119,14 @@ Setup:
    The `--id` **must match** `ROBOT_ID` / `LEADER_ID` in `.env` — calibrations are
    saved to `~/.cache/huggingface/lerobot/calibration/<type>/<id>.json` and loaded
    by id at connect time. Persistent; redo only if you swap motors or change `--id`.
+
+   **This repo already ships calibration** under `calibration/so101_follower.json` and
+   `calibration/so101_leader.json`. The dashboard and `run_robot_client.py` point
+   `calibration_dir` there automatically (override with `CALIBRATION_DIR` in `.env`),
+   so connect won't re-prompt as long as the motors hold matching values. For bare
+   `lerobot-teleoperate`/`-record`, add `--robot.calibration_dir=calibration`.
+   Note: calibration is **per physical arm** — these files match *our* arms; recalibrate
+   if you use different hardware.
 4. Run the dashboard and open it:
    ```bash
    uv run python arm_dashboard.py    # http://localhost:8041
