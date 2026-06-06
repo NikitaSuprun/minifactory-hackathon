@@ -210,12 +210,24 @@ CLIENT_DEVICE=cpu                   # device on the Mac
 Run it:
 
 ```bash
-# On the GPU box (repo cloned, lerobot installed, HF_TOKEN set):
-uv run python run_policy_server.py
-
 # On this Mac (arm + phone camera):
 uv run python run_robot_client.py
 ```
+
+### Deploy the server to the GPU box (Ansible)
+
+Instead of setting up the box by hand, push + launch the server with the
+playbook in `deploy/` (rsyncs the repo — no GitHub auth needed on the box —
+installs uv, writes `.env.local` with your token, `uv sync`, and starts it):
+
+```bash
+HF_TOKEN=$(grep '^HF_TOKEN=' .env.local | cut -d= -f2-) \
+  uvx --from ansible-core ansible-playbook -i deploy/inventory.ini deploy/playbook.yml
+```
+
+Edit `deploy/inventory.ini` for your box's Tailscale IP / user. The token is read
+from the `HF_TOKEN` env var and written to the box's gitignored `.env.local` — it
+is never stored in the playbook or committed.
 
 `run_robot_client.py` assembles the LeRobot CLI from `.env`, including the phone
 camera (`resolve_phone_url()` injects the IP Webcam credentials). The client tells

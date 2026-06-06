@@ -1,0 +1,61 @@
+---
+# Deploy the LeRobot policy server to the GPU box and (re)start it.
+#
+# Run from the repo root:
+#   HF_TOKEN=$(grep '^HF_TOKEN=' .env.local | cut -d= -f2-) \
+#     uvx --from ansible-core ansible-playbook -i deploy/inventory.ini deploy/playbook.yml
+#
+# Uses an rsync push from this machine, so the private repo needs no GitHub auth
+# on the box. The HF token is read from the HF_TOKEN env var and written to the
+# box's gitignored .env.local — it is never stored in this playbook or in git.
+- name: Deploy minifactory policy server
+  hosts: gpu
+  gather_facts: false
+  vars:
+    repo_dir: "/home/{{ ansible_user }}/minifactory-hackathon"
+    uv: "/home/{{ ansible_user }}/.local/bin/uv"
+    hf_token: "{{ lookup('env', 'HF_TOKEN') | default('', true) }}"
+  tasks:
+    - name: Sync repo to the box (rsync push from control node)
+      delegate_to: localhost
+      ansible.builtin.command:
+        cmd: >
+          rsync -az --delete
+          --exclude .git --exclude .venv --exclude .env.local
+          --exclude __pycache__ --exclude .ruff_cache --exclude .pyright_cache
+          --exclude logs --exclude '*.png'
+          {{ playbook_dir }}/../ {{ ansible_user }}@{{ ansible_host }}:{{ repo_dir }}/
+      changed_when: true
+
+    - name: Install uv if missing
+      ansible.builtin.shell: curl -LsSf https://astral.sh/uv/install.sh | sh
+      args:
+        creates: "{{ uv }}"
+
+    - name: Write .env.local with the HF token
+      ansible.builtin.copy:
+        dest: "{{ repo_dir }}/.env.local"
+        mode: "0600"
+        content: "HF_TOKEN={{ hf_token }}\n"
+      when: hf_token | length > 0
+
+    - name: uv sync (downloads CUDA torch + lerobot; can take several minutes)
+      ansible.builtin.command:
+        cmd: "{{ uv }} sync"
+        chdir: "{{ repo_dir }}"
+      changed_when: true
+
+    - name: (Re)start the policy server
+      ansible.builtin.shell: |
+        pkill -f run_policy_server.py || true
+        sleep 1
+        cd {{ repo_dir }}
+        nohup setsid {{ uv }} run python run_policy_server.py \
+          > policy_server.out 2>&1 < /dev/null &
+        sleep 4
+        tail -n 25 policy_server.out || true
+      changed_when: true
+
+    - name: Show listening port
+      ansible.builtin.shell: "ss -tlnp | grep ':{{ lookup('env', 'POLICY_SERVER_PORT') | default('8080', true) }}' || echo 'not listening yet'"
+      changed_when: false

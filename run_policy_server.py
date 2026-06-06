@@ -14,7 +14,16 @@ from __future__ import annotations
 
 import os
 import sys
+from pathlib import Path
 from typing import Final
+
+from dotenv import load_dotenv
+
+# Load .env (committed config) then .env.local (gitignored HF_TOKEN) so the
+# policy can download gated checkpoints. This script does not import phone_camera.
+_HERE: Final[Path] = Path(__file__).resolve().parent
+load_dotenv(_HERE / ".env")
+load_dotenv(_HERE / ".env.local", override=True)
 
 SERVER_HOST: Final[str] = os.environ.get("POLICY_SERVER_HOST", "0.0.0.0")
 SERVER_PORT: Final[str] = os.environ.get("POLICY_SERVER_PORT", "8080")
