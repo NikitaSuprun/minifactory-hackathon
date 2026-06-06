@@ -73,6 +73,8 @@ CAM3_NAME: Final[str] = os.environ.get("CAM3_NAME", "camera3")
 CAM3_WIDTH: Final[str] = os.environ.get("CAM3_WIDTH", "640")
 CAM3_HEIGHT: Final[str] = os.environ.get("CAM3_HEIGHT", "480")
 CAM3_FPS: Final[str] = os.environ.get("CAM3_FPS", "30")
+# "opencv" (cv2 device index) or "oak" (Luxonis OAK-D via depthai).
+CAM3_SOURCE: Final[str] = os.environ.get("CAM3_SOURCE", "opencv").strip().lower()
 
 
 def main() -> None:
@@ -104,7 +106,18 @@ def main() -> None:
             height=int(ARM_CAM_HEIGHT),
             fps=int(ARM_CAM_FPS),
         )
-    if CAM3_INDEX != "":
+    # camera3 is the Luxonis OAK-D (depthai) when CAM3_SOURCE=oak; LeRobot builds it via
+    # its make_device_from_device_class fallback (OakDepthAICameraConfig -> OakDepthAICamera,
+    # registered in oak_lerobot_camera). Otherwise it's a plain cv2 device index.
+    if CAM3_SOURCE == "oak":
+        from oak_lerobot_camera import OakDepthAICameraConfig
+
+        cameras[CAM3_NAME] = OakDepthAICameraConfig(
+            width=int(CAM3_WIDTH),
+            height=int(CAM3_HEIGHT),
+            fps=int(CAM3_FPS),
+        )
+    elif CAM3_INDEX != "":
         cameras[CAM3_NAME] = OpenCVCameraConfig(
             index_or_path=int(CAM3_INDEX),
             width=int(CAM3_WIDTH),
