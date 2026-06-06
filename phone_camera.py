@@ -26,6 +26,8 @@ config into the robot's ``cameras`` dict::
 from __future__ import annotations
 
 import os
+import shutil
+import subprocess
 from pathlib import Path
 from typing import Final
 from urllib.parse import quote, urlsplit, urlunsplit
@@ -48,6 +50,74 @@ HOST_ENV: Final[str] = "PHONE_CAM_HOST"
 PORT_ENV: Final[str] = "PHONE_CAM_PORT"
 PATH_ENV: Final[str] = "PHONE_CAM_PATH"
 
+# USB streaming: tunnel the IP Webcam port over the cable with `adb forward` and
+# connect to localhost instead of the phone's WiFi IP.
+USB_ENV: Final[str] = "PHONE_CAM_USB"
+ADB_BIN_ENV: Final[str] = "PHONE_CAM_ADB"
+ADB_SERIAL_ENV: Final[str] = "PHONE_CAM_ADB_SERIAL"
+ADB_LOCAL_PORT_ENV: Final[str] = "PHONE_CAM_ADB_LOCAL_PORT"
+ADB_REMOTE_PORT_ENV: Final[str] = "PHONE_CAM_ADB_REMOTE_PORT"
+
+
+def _usb_enabled() -> bool:
+    """True when USB streaming (adb port-forward) is requested via env."""
+    return os.environ.get(USB_ENV, "").strip().lower() in {"1", "true", "yes", "on"}
+
+
+def ensure_adb_forward(
+    local_port: int | str,
+    remote_port: int | str,
+    *,
+    adb: str = "adb",
+    serial: str | None = None,
+) -> None:
+    """Tunnel the phone's IP Webcam port to localhost over USB via ``adb forward``.
+
+    Idempotent: re-binding the same local port just replaces the existing rule,
+    and the binding persists in the adb server, so opening the stream later (even
+    from a child process) still reaches the phone. Raises with an actionable
+    message if adb is missing or no authorized device is attached.
+    """
+    if shutil.which(adb) is None:
+        raise FileNotFoundError(
+            f"'{adb}' not found. Install Android platform-tools "
+            "(`brew install android-platform-tools`) or set $PHONE_CAM_ADB."
+        )
+    base = [adb, *(("-s", serial) if serial else ())]
+    devices = subprocess.run(
+        [*base, "devices"], capture_output=True, text=True, check=False
+    )
+    # `adb devices` lists one device per line after the header as "<serial>\tdevice".
+    if "\tdevice" not in devices.stdout:
+        raise ConnectionError(
+            "No authorized USB device for adb. Checklist:\n"
+            "  - Tablet is plugged in and Developer options -> USB debugging is on.\n"
+            "  - You accepted the 'Allow USB debugging?' prompt on the tablet.\n"
+            "  - `adb devices` lists it as 'device' (not 'unauthorized'/'offline')."
+        )
+    forward = subprocess.run(
+        [*base, "forward", f"tcp:{local_port}", f"tcp:{remote_port}"],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    if forward.returncode != 0:
+        raise ConnectionError(
+            f"adb forward tcp:{local_port} tcp:{remote_port} failed: "
+            f"{forward.stderr.strip() or forward.stdout.strip()}"
+        )
+
+
+def _ensure_usb_forward() -> None:
+    """Establish the adb port-forward described by the PHONE_CAM_ADB_* env vars."""
+    port = os.environ.get(PORT_ENV, "8080")
+    ensure_adb_forward(
+        os.environ.get(ADB_LOCAL_PORT_ENV, port),
+        os.environ.get(ADB_REMOTE_PORT_ENV, port),
+        adb=os.environ.get(ADB_BIN_ENV, "adb"),
+        serial=os.environ.get(ADB_SERIAL_ENV) or None,
+    )
+
 
 def phone_url_from_env() -> str | None:
     """Resolve the stream URL from environment / .env.
@@ -59,13 +129,19 @@ def phone_url_from_env() -> str | None:
     url = os.environ.get(DEFAULT_URL_ENV)
     if url:
         return url
+    path = os.environ.get(PATH_ENV, "/video")
+    if not path.startswith("/"):
+        path = "/" + path
+    # USB mode reaches the phone through an adb forward, so the stream lives on
+    # localhost:<local_port> regardless of the phone's WiFi IP.
+    if _usb_enabled():
+        port = os.environ.get(PORT_ENV, "8080")
+        local_port = os.environ.get(ADB_LOCAL_PORT_ENV, port)
+        return f"http://localhost:{local_port}{path}"
     host = os.environ.get(HOST_ENV)
     if not host:
         return None
     port = os.environ.get(PORT_ENV, "8080")
-    path = os.environ.get(PATH_ENV, "/video")
-    if not path.startswith("/"):
-        path = "/" + path
     return f"http://{host}:{port}{path}"
 
 
@@ -123,6 +199,10 @@ def resolve_phone_url(
     ``_PATH`` trio; ``user``/``password`` fall back to ``$PHONE_CAM_USER``/
     ``$PHONE_CAM_PASS``. Credentials are injected only when the URL has none.
     """
+    # In USB mode, establish the adb forward before handing back a localhost URL
+    # so whoever opens the stream next (this process or a child) can reach it.
+    if _usb_enabled():
+        _ensure_usb_forward()
     url = url or phone_url_from_env()
     if not url:
         raise ValueError(

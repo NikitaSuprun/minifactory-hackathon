@@ -39,7 +39,9 @@ def main() -> int:
             "  - IP Webcam app is running and you tapped 'Start server'.\n"
             "  - Phone and Mac are on the same WiFi (no guest/client isolation).\n"
             "  - The IP matches the one shown in the app.\n"
-            "  - Try the '/videofeed' path if '/video' fails."
+            "  - Try the '/videofeed' path if '/video' fails.\n"
+            "  - USB mode (PHONE_CAM_USB=true): `adb devices` lists the tablet and "
+            "USB debugging is authorized."
         )
         return 1
     except ValueError as e:

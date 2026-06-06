@@ -274,14 +274,33 @@ is never stored in the playbook or committed.
 camera (`resolve_phone_url()` injects the IP Webcam credentials). The client tells
 the server which policy to load.
 
-## Optional: lowest latency over USB
+## Stream over USB (lowest latency, highest quality)
 
-Tether the phone over USB and forward the port with adb, then use `localhost`:
+Carry the same IP Webcam stream over the USB cable instead of WiFi. USB is a
+stable ~480 Mbps link (vs WiFi packet loss / latency spikes), so you can push the
+app's **Quality** near max at 640x480@30 — the MJPEG only needs ~5–15 Mbps.
 
-```bash
-adb forward tcp:8080 tcp:8080
-uv run python scripts/check_phone_stream.py http://localhost:8080/video
+One-time setup:
+
+1. Install adb: `brew install android-platform-tools`.
+2. On the tablet: **Settings → Developer options → USB debugging** on, plug in
+   the cable, and accept the "Allow USB debugging?" prompt. Confirm with
+   `adb devices` (it should list the tablet as `device`).
+3. Keep **IP Webcam** running ("Start server") as usual.
+
+Then just flip the switch in [`.env`](.env):
+
+```dotenv
+PHONE_CAM_USB=true
 ```
+
+The code forces the host to `localhost` and runs `adb forward` automatically (in
+`phone_camera.py`), so `PHONE_CAM_HOST` is ignored — no other changes needed.
+Verify with `uv run python scripts/check_phone_stream.py`.
+
+**Best quality at 640x480@30 over USB** — in the IP Webcam app: Resolution
+`640x480`, **Quality ~90–100%** (vs ~50% on WiFi), FPS limit `30`, continuous
+focus, audio off, and good even lighting. Prefer MJPEG over RTSP/H.264 (see Notes).
 
 ## Notes
 
