@@ -4,7 +4,7 @@ export interface Status {
   inference_running: boolean;
   inference_status: string;
   control_fps: number;
-  camera_fps: { phone: number; wrist: number };
+  camera_fps: { phone: number; wrist: number; camera3: number };
   joints: Record<string, number>;
   error: string | null;
   device: string;

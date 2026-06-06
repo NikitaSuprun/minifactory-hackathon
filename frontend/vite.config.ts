@@ -14,6 +14,7 @@ const apiPaths = [
   "/inference",
   "/camera.mjpeg",
   "/wrist.mjpeg",
+  "/camera3.mjpeg",
 ];
 
 export default defineConfig({

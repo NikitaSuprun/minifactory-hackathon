@@ -68,6 +68,9 @@ CALIB_DIR: Final[Path] = Path(
 ARM_CAM_INDEX: Final[str] = os.environ.get("ARM_CAM_INDEX", "")
 ARM_CAM_WIDTH: Final[int] = int(os.environ.get("ARM_CAM_WIDTH", "640"))
 ARM_CAM_HEIGHT: Final[int] = int(os.environ.get("ARM_CAM_HEIGHT", "480"))
+CAM3_INDEX: Final[str] = os.environ.get("CAM3_INDEX", "")
+CAM3_WIDTH: Final[int] = int(os.environ.get("CAM3_WIDTH", "640"))
+CAM3_HEIGHT: Final[int] = int(os.environ.get("CAM3_HEIGHT", "480"))
 CLIENT_LOG: Final[Path] = _HERE / "logs" / "client.out"
 SERVER_LOG_REMOTE: Final[str] = "~/minifactory-hackathon/policy_server.out"
 # Built Vite SPA (committed). Served when present; otherwise the inline HTML below.
@@ -103,12 +106,14 @@ class AppState:
     processors: tuple[Any, Any, Any] | None = None
     camera: Any = None
     wrist_cam: Any = None
+    cam3: Any = None
     teleop_thread: threading.Thread | None = None
     stop_event: threading.Event = field(default_factory=threading.Event)
     lock: threading.Lock = field(default_factory=threading.Lock)
     # Serializes wrist-cam read() against release() so freeing it (on inference start)
     # can't race a concurrent read in the preview generator and segfault OpenCV.
     wrist_cam_lock: threading.Lock = field(default_factory=threading.Lock)
+    cam3_lock: threading.Lock = field(default_factory=threading.Lock)
     infer_proc: subprocess.Popen[bytes] | None = None
     infer_task: str = DEFAULT_POLICY_TASK
     inference_status: str = "idle"  # idle | running | error
@@ -118,6 +123,8 @@ class AppState:
     phone_fps_at: float = 0.0
     wrist_fps: float = 0.0
     wrist_fps_at: float = 0.0
+    cam3_fps: float = 0.0
+    cam3_fps_at: float = 0.0
     error: str | None = None
 
     @property
@@ -196,6 +203,16 @@ def _release_wrist_cam() -> None:
             state.wrist_cam = None
 
 
+def _release_cam3() -> None:
+    with state.cam3_lock:
+        if state.cam3 is not None:
+            try:
+                state.cam3.release()
+            except Exception:  # noqa: BLE001 - best-effort
+                pass
+            state.cam3 = None
+
+
 def _disconnect_arms() -> None:
     _stop_teleop_thread()
     for dev in (state.teleop, state.robot):
@@ -233,6 +250,7 @@ def _start_inference(task: str) -> None:
     # Free the hardware so run_robot_client.py can own the arm + wrist camera.
     _disconnect_arms()
     _release_wrist_cam()
+    _release_cam3()
     CLIENT_LOG.parent.mkdir(parents=True, exist_ok=True)
     state.infer_task = task
     state.error = None
@@ -376,6 +394,22 @@ def _get_wrist_cam() -> Any:
     return state.wrist_cam
 
 
+def _get_cam3() -> Any:
+    if not CAM3_INDEX:
+        raise RuntimeError("CAM3_INDEX is not set in .env")
+    if state.cam3 is None:
+        with state.lock:
+            if state.cam3 is None:
+                cap = cv2.VideoCapture(int(CAM3_INDEX))
+                cap.set(cv2.CAP_PROP_FRAME_WIDTH, CAM3_WIDTH)
+                cap.set(cv2.CAP_PROP_FRAME_HEIGHT, CAM3_HEIGHT)
+                if not cap.isOpened():
+                    cap.release()
+                    raise RuntimeError(f"failed to open cam3 index {CAM3_INDEX}")
+                state.cam3 = cap
+    return state.cam3
+
+
 def _mjpeg_generator() -> Iterator[bytes]:
     cam = _get_camera()
     times: list[float] = []
@@ -413,6 +447,27 @@ def _wrist_mjpeg_generator() -> Iterator[bytes]:
         yield (b"--frame\r\nContent-Type: image/jpeg\r\n\r\n" + jpg.tobytes() + b"\r\n")
 
 
+def _cam3_mjpeg_generator() -> Iterator[bytes]:
+    _get_cam3()  # open it (if needed) before streaming
+    times: list[float] = []
+    while True:
+        # Read under the lock and re-fetch each iteration: if inference released the
+        # cam, state.cam3 is None and we stop instead of reading freed memory.
+        with state.cam3_lock:
+            cap = state.cam3
+            if cap is None:
+                return
+            ok, frame = cap.read()  # already BGR
+        if not ok:
+            time.sleep(0.05)
+            continue
+        ok2, jpg = cv2.imencode(".jpg", frame)
+        if not ok2:
+            continue
+        state.cam3_fps, state.cam3_fps_at = _tick_fps(times), time.perf_counter()
+        yield (b"--frame\r\nContent-Type: image/jpeg\r\n\r\n" + jpg.tobytes() + b"\r\n")
+
+
 # --- Routes -----------------------------------------------------------------
 @app.get("/", response_class=HTMLResponse)
 def index() -> Any:
@@ -430,6 +485,7 @@ def status() -> JSONResponse:
     now = time.perf_counter()
     phone = state.phone_fps if now - state.phone_fps_at < 2.0 else 0.0
     wrist = state.wrist_fps if now - state.wrist_fps_at < 2.0 else 0.0
+    cam3 = state.cam3_fps if now - state.cam3_fps_at < 2.0 else 0.0
     return JSONResponse(
         {
             "connected": state.connected,
@@ -437,7 +493,11 @@ def status() -> JSONResponse:
             "inference_running": state.inference_running,
             "inference_status": state.inference_status,
             "control_fps": state.control_fps,
-            "camera_fps": {"phone": round(phone, 1), "wrist": round(wrist, 1)},
+            "camera_fps": {
+                "phone": round(phone, 1),
+                "wrist": round(wrist, 1),
+                "camera3": round(cam3, 1),
+            },
             "joints": state.last_action,
             "error": state.error,
             "device": SERVER_POLICY_DEVICE,
@@ -543,6 +603,17 @@ def wrist_camera() -> StreamingResponse:
     )
 
 
+@app.get("/camera3.mjpeg")
+def camera3_camera() -> StreamingResponse:
+    try:
+        _get_cam3()
+    except Exception as e:  # noqa: BLE001
+        raise HTTPException(status_code=503, detail=f"cam3: {e}") from e
+    return StreamingResponse(
+        _cam3_mjpeg_generator(), media_type="multipart/x-mixed-replace; boundary=frame"
+    )
+
+
 INDEX_HTML: Final[str] = """<!doctype html>
 <html><head><meta charset="utf-8"><title>SO-101 Dashboard</title>
 <style>
@@ -601,6 +672,8 @@ INDEX_HTML: Final[str] = """<!doctype html>
     <img src="/camera.mjpeg" onerror="this.alt='phone camera unavailable'"></div>
   <div class="card"><h3>WRIST CAM <span id="wrist_fps" class="mono"></span></h3>
     <img src="/wrist.mjpeg" onerror="this.alt='wrist cam unavailable (used by client during inference)'"></div>
+  <div class="card"><h3>CAMERA 3 <span id="cam3_fps" class="mono"></span></h3>
+    <img src="/camera3.mjpeg" onerror="this.alt='cam3 unavailable (used by client during inference)'"></div>
 </div>
 
 <div class="row">
@@ -648,6 +721,7 @@ async function refresh(){
   // camera fps
   document.getElementById('phone_fps').textContent = s.camera_fps.phone? `${s.camera_fps.phone} fps`:'';
   document.getElementById('wrist_fps').textContent = s.camera_fps.wrist? `${s.camera_fps.wrist} fps`:'';
+  document.getElementById('cam3_fps').textContent = s.camera_fps.camera3? `${s.camera_fps.camera3} fps`:'';
   // buttons
   setDisabled('b_connect', con||inf);
   setDisabled('b_disconnect', !con||inf);

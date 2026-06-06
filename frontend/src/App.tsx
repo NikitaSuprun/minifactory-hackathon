@@ -177,7 +177,7 @@ export default function App() {
         </div>
       </Card>
 
-      <div className="mb-4 grid gap-4 sm:grid-cols-2">
+      <div className="mb-4 grid gap-4 sm:grid-cols-3">
         <CameraTile
           title="Phone cam"
           src="/camera.mjpeg"
@@ -187,6 +187,11 @@ export default function App() {
           title="Wrist cam"
           src="/wrist.mjpeg"
           fps={s?.camera_fps.wrist ?? 0}
+        />
+        <CameraTile
+          title="Camera 3"
+          src="/camera3.mjpeg"
+          fps={s?.camera_fps.camera3 ?? 0}
         />
       </div>
 

@@ -68,6 +68,11 @@ ARM_CAM_NAME: Final[str] = os.environ.get("ARM_CAM_NAME", "camera2")
 ARM_CAM_WIDTH: Final[str] = os.environ.get("ARM_CAM_WIDTH", "640")
 ARM_CAM_HEIGHT: Final[str] = os.environ.get("ARM_CAM_HEIGHT", "480")
 ARM_CAM_FPS: Final[str] = os.environ.get("ARM_CAM_FPS", "30")
+CAM3_INDEX: Final[str] = os.environ.get("CAM3_INDEX", "")
+CAM3_NAME: Final[str] = os.environ.get("CAM3_NAME", "camera3")
+CAM3_WIDTH: Final[str] = os.environ.get("CAM3_WIDTH", "640")
+CAM3_HEIGHT: Final[str] = os.environ.get("CAM3_HEIGHT", "480")
+CAM3_FPS: Final[str] = os.environ.get("CAM3_FPS", "30")
 
 
 def main() -> None:
@@ -98,6 +103,13 @@ def main() -> None:
             width=int(ARM_CAM_WIDTH),
             height=int(ARM_CAM_HEIGHT),
             fps=int(ARM_CAM_FPS),
+        )
+    if CAM3_INDEX != "":
+        cameras[CAM3_NAME] = OpenCVCameraConfig(
+            index_or_path=int(CAM3_INDEX),
+            width=int(CAM3_WIDTH),
+            height=int(CAM3_HEIGHT),
+            fps=int(CAM3_FPS),
         )
 
     robot_cfg = SO101FollowerConfig(
