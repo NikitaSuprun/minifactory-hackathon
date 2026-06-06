@@ -43,7 +43,7 @@ LEADER_PORT = os.environ.get("LEADER_PORT", "")
 FOLLOWER_ID = os.environ.get("ROBOT_ID", "so101_follower")
 LEADER_ID = os.environ.get("LEADER_ID", "so101_leader")
 TELEOP_FPS = int(os.environ.get("TELEOP_FPS", "60"))
-DASHBOARD_PORT = int(os.environ.get("DASHBOARD_PORT", "8000"))
+DASHBOARD_PORT = int(os.environ.get("DASHBOARD_PORT", "8041"))
 DASHBOARD_USER = os.environ.get("DASHBOARD_USER", "admin")
 DASHBOARD_PASS = os.environ.get("DASHBOARD_PASS", "")
 
