@@ -46,13 +46,17 @@
       changed_when: true
 
     - name: (Re)start the policy server
+      # The running process is `python -m lerobot.async_inference.policy_server`
+      # (run_policy_server.py exec's into it). The '[l]erobot' bracket trick makes
+      # the regex match that process but NOT this script's own command line, so
+      # pkill -f doesn't SIGTERM its own task.
       ansible.builtin.shell: |
-        pkill -f run_policy_server.py || true
+        pkill -f '[l]erobot.async_inference.policy_server' || true
         sleep 1
         cd {{ repo_dir }}
         nohup setsid {{ uv }} run python run_policy_server.py \
           > policy_server.out 2>&1 < /dev/null &
-        sleep 4
+        sleep 6
         tail -n 25 policy_server.out || true
       changed_when: true
 
