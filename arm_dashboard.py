@@ -823,16 +823,52 @@ def record_event(req: RecordEventRequest) -> dict[str, str]:
 
 
 # --- Datasets (record output: list, replay viewer, upload verification) ------
+_hf_ds_cache: set[str] | None = None
+_hf_ds_at: float = 0.0
+
+
+def _hf_dataset_ids() -> set[str] | None:
+    """Repo ids of the user's Hub datasets (cached ~30s).
+
+    None when HF is unreachable / no token, so callers fall back to the local list."""
+    global _hf_ds_cache, _hf_ds_at
+    now = time.perf_counter()
+    if _hf_ds_cache is not None and now - _hf_ds_at < 30.0:
+        return _hf_ds_cache
+    try:
+        from huggingface_hub import HfApi
+
+        from recording import resolve_hf_username
+
+        api = HfApi(token=os.environ.get("HF_TOKEN"))
+        _hf_ds_cache = {d.id for d in api.list_datasets(author=resolve_hf_username())}
+    except Exception:  # noqa: BLE001 - offline/no token: keep last-known (may be None)
+        pass
+    _hf_ds_at = now
+    return _hf_ds_cache
+
+
 def _scan_datasets() -> list[dict[str, Any]]:
-    """List local LeRobot datasets under the cache root ({user}/{name}/meta/info.json)."""
+    """List the user's Hugging Face datasets that are also present locally (so viewable).
+
+    Each is ``{user}/{name}/meta/info.json`` in the cache. When the Hub can't be reached we
+    fall back to local datasets that have episodes, so the tab still works offline."""
     out: list[dict[str, Any]] = []
     if not LEROBOT_ROOT.is_dir():
         return out
+    hf_ids = _hf_dataset_ids()
     for info_path in LEROBOT_ROOT.glob("*/*/meta/info.json"):
         ds_dir = info_path.parent.parent
         repo_id = str(ds_dir.relative_to(LEROBOT_ROOT))
         info = _read_json(info_path)
         if not info:
+            continue
+        if hf_ids is not None:
+            if repo_id not in hf_ids:  # only datasets uploaded to the user's HF account
+                continue
+        elif (
+            info.get("total_episodes", 0) <= 0
+        ):  # offline fallback: hide empty/aborted runs
             continue
         cams = [
             k.split(".")[-1]

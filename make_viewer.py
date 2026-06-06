@@ -111,24 +111,36 @@ _HTML_TEMPLATE = r"""<!doctype html>
 <title>LeRobot dataset viewer</title>
 <style>
   :root { color-scheme: dark; }
-  body { font-family: -apple-system, system-ui, sans-serif; margin: 0; background:#111; color:#eee; }
-  header { padding: 12px 18px; background:#1b1b1b; border-bottom:1px solid #333; }
-  header h1 { font-size: 15px; margin: 0 0 4px; font-weight: 600; }
-  header .meta { font-size: 12px; color:#9aa; }
-  .videos { display:flex; flex-wrap:wrap; gap:10px; padding:14px 18px; }
-  .vid { background:#000; border:1px solid #333; border-radius:6px; overflow:hidden; }
-  .vid .cap { font-size:11px; color:#9aa; padding:4px 8px; background:#1b1b1b; }
-  video { display:block; width:340px; height:255px; background:#000; }
-  .controls { padding: 6px 18px 14px; display:flex; align-items:center; gap:12px; }
-  .controls button { background:#2a2a2a; color:#eee; border:1px solid #444; border-radius:5px; padding:6px 12px; cursor:pointer; }
+  html, body { height:100%; margin:0; overflow:hidden; }
+  body { font-family:-apple-system, system-ui, sans-serif; background:#111; color:#eee;
+         display:flex; flex-direction:column; height:100vh; }
+  header { flex:0 0 auto; padding:8px 16px; background:#1b1b1b; border-bottom:1px solid #333;
+           display:flex; align-items:baseline; gap:12px; }
+  header h1 { font-size:14px; margin:0; font-weight:600; }
+  header .meta { font-size:12px; color:#9aa; }
+  /* videos: one row, 3 (or N) equal columns */
+  .videos { flex:0 0 40vh; display:grid; gap:8px; padding:10px 16px; min-height:0; }
+  .vid { display:flex; flex-direction:column; min-width:0; background:#000;
+         border:1px solid #333; border-radius:6px; overflow:hidden; }
+  .vid .cap { flex:0 0 auto; font-size:11px; color:#9aa; padding:3px 8px; background:#1b1b1b; }
+  video { flex:1; min-height:0; width:100%; background:#000; object-fit:contain; display:block; }
+  .controls { flex:0 0 auto; padding:4px 16px; display:flex; align-items:center; gap:12px; }
+  .controls button { background:#2a2a2a; color:#eee; border:1px solid #444; border-radius:5px;
+                     padding:5px 12px; cursor:pointer; }
   #scrub { flex:1; }
-  #tlabel { font-variant-numeric: tabular-nums; font-size:12px; color:#9aa; min-width:150px; text-align:right;}
-  .charts { padding: 0 18px 24px; }
-  .chartblock h2 { font-size:13px; margin:14px 0 6px; color:#cdd; }
-  canvas.plot { width:100%; height:220px; background:#161616; border:1px solid #333; border-radius:6px; }
-  .legend { font-size:11px; color:#9aa; margin-top:4px; display:flex; flex-wrap:wrap; gap:10px;}
-  .legend span { display:inline-flex; align-items:center; gap:4px;}
-  .legend i { width:10px; height:10px; border-radius:2px; display:inline-block; }
+  #tlabel { font-variant-numeric:tabular-nums; font-size:12px; color:#9aa;
+            min-width:140px; text-align:right; }
+  /* charts: action + qpos side by side, filling the rest of the viewport */
+  .charts { flex:1 1 auto; min-height:0; display:grid; grid-template-columns:1fr 1fr;
+            gap:10px; padding:4px 16px 12px; }
+  .chartblock { display:flex; flex-direction:column; min-width:0; min-height:0; }
+  .chartblock h2 { flex:0 0 auto; font-size:12px; margin:0 0 4px; color:#cdd; }
+  canvas.plot { flex:1; min-height:0; width:100%; background:#161616;
+                border:1px solid #333; border-radius:6px; }
+  .legend { flex:0 0 auto; font-size:10px; color:#9aa; margin-top:4px;
+            display:flex; flex-wrap:wrap; gap:8px; }
+  .legend span { display:inline-flex; align-items:center; gap:4px; }
+  .legend i { width:9px; height:9px; border-radius:2px; display:inline-block; }
 </style>
 </head>
 <body>
@@ -156,8 +168,9 @@ document.getElementById("title").textContent =
 document.getElementById("metaline").textContent =
   `${DATA.num_frames} frames · ${DATA.fps} fps · ${DATA.duration.toFixed(2)}s · ${DATA.videos.length} cameras`;
 
-// ---- videos ----
+// ---- videos: one row of N equal columns ----
 const vidWrap = document.getElementById("videos");
+vidWrap.style.gridTemplateColumns = `repeat(${DATA.videos.length || 1}, 1fr)`;
 const videoEls = [];
 DATA.videos.forEach(v => {
   const box = document.createElement("div"); box.className = "vid";
@@ -190,6 +203,7 @@ function makeChart(title, names, series) {
   function draw(playT){
     const dpr = window.devicePixelRatio||1;
     const w = cv.clientWidth, h = cv.clientHeight;
+    if(w===0 || h===0) return;
     cv.width = w*dpr; cv.height = h*dpr;
     const ctx = cv.getContext("2d"); ctx.scale(dpr,dpr);
     ctx.clearRect(0,0,w,h);
@@ -215,7 +229,7 @@ function makeChart(title, names, series) {
 }
 
 const drawAction = makeChart("action", DATA.action_names, DATA.actions);
-const drawState  = makeChart("observation.state", DATA.state_names, DATA.states);
+const drawState  = makeChart("observation.state (qpos)", DATA.state_names, DATA.states);
 
 // ---- sync loop ----
 const scrub = document.getElementById("scrub");
