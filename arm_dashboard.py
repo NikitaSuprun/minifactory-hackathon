@@ -117,6 +117,9 @@ class AppState:
     robot: Any = None
     teleop: Any = None
     processors: tuple[Any, Any, Any] | None = None
+    hf_username: str | None = (
+        None  # prewarmed at connect so Record doesn't await the network
+    )
     teleop_thread: threading.Thread | None = None
     stop_event: threading.Event = field(default_factory=threading.Event)
     lock: threading.Lock = field(default_factory=threading.Lock)
@@ -226,7 +229,7 @@ def _connect_arms() -> None:
     from lerobot.teleoperators.so_leader import SO101Leader, SO101LeaderConfig
     from lerobot.utils.import_utils import register_third_party_plugins
 
-    from recording import build_cameras
+    from recording import build_cameras, resolve_hf_username
 
     if not FOLLOWER_PORT or not LEADER_PORT:
         raise RuntimeError(
@@ -261,6 +264,12 @@ def _connect_arms() -> None:
     state.robot = robot
     state.teleop = teleop
     state.processors = make_default_processors()
+    # Prewarm the HF username (a network call) so Record starts the instant the countdown
+    # ends instead of awaiting it. Best-effort: re-resolved at record time if it fails here.
+    try:
+        state.hf_username = resolve_hf_username()
+    except ValueError:
+        state.hf_username = None
     state.error = None
 
 
@@ -297,6 +306,7 @@ def _disconnect_arms() -> None:
         except Exception as e:  # noqa: BLE001 - best-effort cleanup
             state.error = f"disconnect: {e}"
     state.robot = state.teleop = state.processors = None
+    state.hf_username = None
 
 
 def _teleop_worker() -> None:
@@ -394,8 +404,9 @@ def _on_record_phase(
 def _record_worker(req: RecordRequest) -> None:
     """Record a dataset in-process, reusing the already-connected robot + leader.
 
-    Pauses the dashboard's teleop loop (so only record_loop drives the follower), records the
-    requested episodes via the shared session driver, pushes to the Hub, then resumes teleop.
+    The dashboard's teleop loop keeps driving the arms through all setup (username, dataset
+    creation); we hand off to record_loop only at the last moment so the arms never freeze
+    between the countdown and recording. Pushes to the Hub, then resumes teleop.
     """
     from lerobot.datasets.feature_utils import hw_to_dataset_features
     from lerobot.datasets.lerobot_dataset import LeRobotDataset
@@ -404,10 +415,10 @@ def _record_worker(req: RecordRequest) -> None:
 
     assert state.processors is not None  # guaranteed by the connected-arms precondition
     try:
-        repo_id = f"{resolve_hf_username()}/{req.name}"
+        # Setup while teleop still drives the follower (none of this touches the robot).
+        username = state.hf_username or resolve_hf_username()
+        repo_id = f"{username}/{req.name}"
         state.record_repo_id = repo_id
-        # Pause teleop so record_loop is the sole driver of the follower.
-        _stop_teleop_thread()
 
         action_features = hw_to_dataset_features(state.robot.action_features, "action")  # pyright: ignore[reportArgumentType]
         obs_features = hw_to_dataset_features(
@@ -422,6 +433,10 @@ def _record_worker(req: RecordRequest) -> None:
             image_writer_threads=4,
         )
 
+        # Hand off: stop the dashboard teleop loop and let record_loop be the sole driver of
+        # the follower (only one loop may command it). This is the only brief pause, and
+        # record_loop resumes teleoperation immediately on its first iteration.
+        _stop_teleop_thread()
         recorded = run_record_session(
             robot=state.robot,
             teleop=state.teleop,
