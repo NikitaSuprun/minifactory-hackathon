@@ -86,6 +86,50 @@ url = with_credentials("http://192.168.1.42:8080/video", "admin", "123123")
 robot_config.cameras = {"phone": build_phone_camera_config(url)}
 ```
 
+## 6. Web control dashboard (SO-101 teleop)
+
+A minimal browser dashboard to control the SO-101 leader/follower pair lives in
+[`arm_dashboard.py`](arm_dashboard.py). **Both arms plug into this computer over
+USB.** It can connect/disconnect the arms, start/stop teleoperation (leader drives
+follower), shows the live phone camera, and polls status. Record + inference are
+scaffolded as TODO hooks (teleop first).
+
+Setup:
+
+1. Find the USB serial ports and put them in `.env`:
+   ```bash
+   uv run lerobot-find-port      # run once per arm, unplug to identify
+   ```
+   ```dotenv
+   FOLLOWER_PORT=/dev/tty.usbmodemXXXX
+   LEADER_PORT=/dev/tty.usbmodemYYYY
+   ```
+2. Calibrate each arm once (first time only):
+   ```bash
+   uv run lerobot-calibrate --robot.type=so101_follower --robot.port=$FOLLOWER_PORT --robot.id=so101_follower
+   uv run lerobot-calibrate --teleop.type=so101_leader  --teleop.port=$LEADER_PORT  --teleop.id=so101_leader
+   ```
+3. Run the dashboard and open it:
+   ```bash
+   uv run python arm_dashboard.py    # http://localhost:8041
+   ```
+   The port is set by `DASHBOARD_PORT` in `.env` (default 8041).
+
+### Login (protects the dashboard + APIs)
+
+The dashboard binds to `0.0.0.0`, so it's reachable on the WiFi. Every route
+(page, APIs, camera) is behind **HTTP Basic Auth** — the browser shows a login
+prompt. Credentials come from `.env`:
+
+```dotenv
+DASHBOARD_USER=admin
+DASHBOARD_PASS=123123     # leave empty to disable auth (prints a warning)
+```
+
+> Like the camera, this is Basic Auth over plain HTTP on the LAN — fine for a
+> hackathon, but the password is base64 (not encrypted) on the wire. Keep it
+> throwaway.
+
 ## Optional: lowest latency over USB
 
 Tether the phone over USB and forward the port with adb, then use `localhost`:
