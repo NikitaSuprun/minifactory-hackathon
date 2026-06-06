@@ -28,29 +28,31 @@ Phone and Mac must be on the **same WiFi** (guest networks / "client isolation"
 will block this). Confirm by opening `http://<phone-ip>:8080` in the Mac's browser —
 you should see the live video and controls.
 
-## 3. Verify ingestion via LeRobot
+## 3. Configure `.env`
 
-```bash
-uv run python scripts/check_phone_stream.py http://<phone-ip>:8080/video
-# or:
-export PHONE_CAM_URL=http://<phone-ip>:8080/video
-uv run python scripts/check_phone_stream.py
+All connection settings live in the committed [`.env`](.env). Edit
+`PHONE_CAM_HOST` to your phone's IP (and the login/password if you set them):
+
+```dotenv
+PHONE_CAM_HOST=192.168.1.42
+PHONE_CAM_PORT=8080
+PHONE_CAM_PATH=/video
+PHONE_CAM_USER=admin
+PHONE_CAM_PASS=123123
 ```
 
-If you enabled login/password in the app, either embed the credentials in the URL:
+The URL is assembled from these as `http://USER:PASS@HOST:PORT/PATH`. Set
+`PHONE_CAM_URL` instead if you want to override the whole thing.
+
+> The `.env` is committed on purpose for this hackathon. That means the password
+> is in git history — keep it a throwaway, LAN-only value, never a real secret.
+
+## 4. Verify ingestion via LeRobot
 
 ```bash
+uv run python scripts/check_phone_stream.py            # uses .env
+# or pass an explicit URL (overrides .env):
 uv run python scripts/check_phone_stream.py http://admin:123123@<phone-ip>:8080/video
-```
-
-…or keep them out of the command/code via environment variables (injected
-automatically when the URL has no credentials):
-
-```bash
-export PHONE_CAM_URL=http://<phone-ip>:8080/video
-export PHONE_CAM_USER=admin
-export PHONE_CAM_PASS=123123
-uv run python scripts/check_phone_stream.py
 ```
 
 Expected: it prints the detected resolution, achieved FPS, and a latency proxy,
@@ -61,7 +63,7 @@ LeRobot's `OpenCVCamera` is ingesting the stream.
 > preview window — use the phone's browser page for live view; the script proves
 > ingestion via stats + the saved snapshot.
 
-## 4. Use the phone camera in LeRobot (later)
+## 5. Use the phone camera in LeRobot (later)
 
 ```python
 from phone_camera import build_phone_camera_config

@@ -26,14 +26,43 @@ config into the robot's ``cameras`` dict::
 from __future__ import annotations
 
 import os
+from pathlib import Path
 from urllib.parse import quote, urlsplit, urlunsplit
+
+from dotenv import load_dotenv
 
 from lerobot.cameras.configs import Cv2Rotation
 from lerobot.cameras.opencv import OpenCVCamera, OpenCVCameraConfig
 
+# Load connection settings from the committed .env next to this module.
+load_dotenv(Path(__file__).resolve().parent / ".env")
+
 DEFAULT_URL_ENV = "PHONE_CAM_URL"
 USER_ENV = "PHONE_CAM_USER"
 PASS_ENV = "PHONE_CAM_PASS"
+HOST_ENV = "PHONE_CAM_HOST"
+PORT_ENV = "PHONE_CAM_PORT"
+PATH_ENV = "PHONE_CAM_PATH"
+
+
+def phone_url_from_env() -> str | None:
+    """Resolve the stream URL from environment / .env.
+
+    Prefers an explicit ``PHONE_CAM_URL``; otherwise assembles it from
+    ``PHONE_CAM_HOST`` (+ optional ``PHONE_CAM_PORT`` and ``PHONE_CAM_PATH``).
+    Returns None if no host/url is configured.
+    """
+    url = os.environ.get(DEFAULT_URL_ENV)
+    if url:
+        return url
+    host = os.environ.get(HOST_ENV)
+    if not host:
+        return None
+    port = os.environ.get(PORT_ENV, "8080")
+    path = os.environ.get(PATH_ENV, "/video")
+    if not path.startswith("/"):
+        path = "/" + path
+    return f"http://{host}:{port}{path}"
 
 
 def with_credentials(url: str, user: str, password: str) -> str:
@@ -87,16 +116,17 @@ def open_phone_camera(
 ) -> OpenCVCamera:
     """Build, connect, and return an OpenCVCamera for the phone stream.
 
-    ``url`` falls back to ``$PHONE_CAM_URL``; ``user``/``password`` fall back to
-    ``$PHONE_CAM_USER``/``$PHONE_CAM_PASS`` (handy for keeping the password out of
-    code and shell history). Credentials are injected only when the URL has none.
-    Caller is responsible for ``camera.disconnect()``.
+    ``url`` falls back to ``$PHONE_CAM_URL`` or the ``$PHONE_CAM_HOST``/``_PORT``/
+    ``_PATH`` trio; ``user``/``password`` fall back to ``$PHONE_CAM_USER``/
+    ``$PHONE_CAM_PASS``. All of these can live in the committed ``.env``.
+    Credentials are injected only when the URL has none. Caller is responsible
+    for ``camera.disconnect()``.
     """
-    url = url or os.environ.get(DEFAULT_URL_ENV)
+    url = url or phone_url_from_env()
     if not url:
         raise ValueError(
-            f"No stream URL provided and ${DEFAULT_URL_ENV} is not set. "
-            "Pass e.g. 'http://192.168.1.42:8080/video'."
+            f"No stream URL provided and neither ${DEFAULT_URL_ENV} nor ${HOST_ENV} "
+            "is set (check .env). Pass e.g. 'http://192.168.1.42:8080/video'."
         )
 
     user = user or os.environ.get(USER_ENV)
