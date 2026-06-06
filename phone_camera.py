@@ -26,11 +26,28 @@ config into the robot's ``cameras`` dict::
 from __future__ import annotations
 
 import os
+from urllib.parse import quote, urlsplit, urlunsplit
 
 from lerobot.cameras.configs import Cv2Rotation
 from lerobot.cameras.opencv import OpenCVCamera, OpenCVCameraConfig
 
 DEFAULT_URL_ENV = "PHONE_CAM_URL"
+USER_ENV = "PHONE_CAM_USER"
+PASS_ENV = "PHONE_CAM_PASS"
+
+
+def with_credentials(url: str, user: str, password: str) -> str:
+    """Embed HTTP Basic Auth credentials into a stream URL.
+
+    IP Webcam's "Login/password" option protects the stream with Basic Auth;
+    cv2/FFmpeg reads ``http://user:pass@host:port/path``. Credentials are
+    percent-encoded so special characters survive.
+    """
+    parts = urlsplit(url)
+    netloc = f"{quote(user, safe='')}:{quote(password, safe='')}@{parts.hostname}"
+    if parts.port:
+        netloc += f":{parts.port}"
+    return urlunsplit((parts.scheme, netloc, parts.path, parts.query, parts.fragment))
 
 
 def build_phone_camera_config(
@@ -61,10 +78,18 @@ def build_phone_camera_config(
     )
 
 
-def open_phone_camera(url: str | None = None, **kwargs) -> OpenCVCamera:
+def open_phone_camera(
+    url: str | None = None,
+    *,
+    user: str | None = None,
+    password: str | None = None,
+    **kwargs,
+) -> OpenCVCamera:
     """Build, connect, and return an OpenCVCamera for the phone stream.
 
-    If ``url`` is None, falls back to the ``PHONE_CAM_URL`` environment variable.
+    ``url`` falls back to ``$PHONE_CAM_URL``; ``user``/``password`` fall back to
+    ``$PHONE_CAM_USER``/``$PHONE_CAM_PASS`` (handy for keeping the password out of
+    code and shell history). Credentials are injected only when the URL has none.
     Caller is responsible for ``camera.disconnect()``.
     """
     url = url or os.environ.get(DEFAULT_URL_ENV)
@@ -73,6 +98,12 @@ def open_phone_camera(url: str | None = None, **kwargs) -> OpenCVCamera:
             f"No stream URL provided and ${DEFAULT_URL_ENV} is not set. "
             "Pass e.g. 'http://192.168.1.42:8080/video'."
         )
+
+    user = user or os.environ.get(USER_ENV)
+    password = password or os.environ.get(PASS_ENV)
+    if user and password and "@" not in urlsplit(url).netloc:
+        url = with_credentials(url, user, password)
+
     camera = OpenCVCamera(build_phone_camera_config(url, **kwargs))
     camera.connect()
     return camera

@@ -15,8 +15,11 @@ The phone runs the **IP Webcam** app and serves an MJPEG stream; LeRobot's
    - Quality: ~50%
    - FPS limit: 30
    - Disable audio streaming
-3. Scroll to the bottom and tap **Start server**.
-4. The app shows a URL like `http://192.168.1.42:8080`. The MJPEG stream is that
+3. (Optional) Protect the stream: under **Connection → Login/password**, set a
+   **Login** and **Password** (e.g. `admin` / `123123`). The stream then requires
+   HTTP Basic Auth.
+4. Scroll to the bottom and tap **Start server**.
+5. The app shows a URL like `http://192.168.1.42:8080`. The MJPEG stream is that
    address + `/video`, e.g. `http://192.168.1.42:8080/video`.
 
 ## 2. Network check
@@ -31,6 +34,22 @@ you should see the live video and controls.
 uv run python scripts/check_phone_stream.py http://<phone-ip>:8080/video
 # or:
 export PHONE_CAM_URL=http://<phone-ip>:8080/video
+uv run python scripts/check_phone_stream.py
+```
+
+If you enabled login/password in the app, either embed the credentials in the URL:
+
+```bash
+uv run python scripts/check_phone_stream.py http://admin:123123@<phone-ip>:8080/video
+```
+
+…or keep them out of the command/code via environment variables (injected
+automatically when the URL has no credentials):
+
+```bash
+export PHONE_CAM_URL=http://<phone-ip>:8080/video
+export PHONE_CAM_USER=admin
+export PHONE_CAM_PASS=123123
 uv run python scripts/check_phone_stream.py
 ```
 
@@ -54,6 +73,16 @@ robot_config.cameras = {
 
 `build_phone_camera_config` leaves `fps/width/height` unset so LeRobot auto-detects
 the stream profile — set resolution/FPS in the IP Webcam app, not in code.
+
+For a password-protected stream, embed credentials in the URL (optionally via the
+`with_credentials` helper):
+
+```python
+from phone_camera import build_phone_camera_config, with_credentials
+
+url = with_credentials("http://192.168.1.42:8080/video", "admin", "123123")
+robot_config.cameras = {"phone": build_phone_camera_config(url)}
+```
 
 ## Optional: lowest latency over USB
 
