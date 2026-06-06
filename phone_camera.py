@@ -27,6 +27,7 @@ from __future__ import annotations
 
 import os
 from pathlib import Path
+from typing import Final
 from urllib.parse import quote, urlsplit, urlunsplit
 
 from dotenv import load_dotenv
@@ -34,15 +35,18 @@ from dotenv import load_dotenv
 from lerobot.cameras.configs import Cv2Rotation
 from lerobot.cameras.opencv import OpenCVCamera, OpenCVCameraConfig
 
-# Load connection settings from the committed .env next to this module.
-load_dotenv(Path(__file__).resolve().parent / ".env")
+# Load connection settings from the committed .env next to this module, then
+# overlay gitignored local secrets (HF_TOKEN etc.) from .env.local if present.
+_HERE: Final[Path] = Path(__file__).resolve().parent
+load_dotenv(_HERE / ".env")
+load_dotenv(_HERE / ".env.local", override=True)
 
-DEFAULT_URL_ENV = "PHONE_CAM_URL"
-USER_ENV = "PHONE_CAM_USER"
-PASS_ENV = "PHONE_CAM_PASS"
-HOST_ENV = "PHONE_CAM_HOST"
-PORT_ENV = "PHONE_CAM_PORT"
-PATH_ENV = "PHONE_CAM_PATH"
+DEFAULT_URL_ENV: Final[str] = "PHONE_CAM_URL"
+USER_ENV: Final[str] = "PHONE_CAM_USER"
+PASS_ENV: Final[str] = "PHONE_CAM_PASS"
+HOST_ENV: Final[str] = "PHONE_CAM_HOST"
+PORT_ENV: Final[str] = "PHONE_CAM_PORT"
+PATH_ENV: Final[str] = "PHONE_CAM_PATH"
 
 
 def phone_url_from_env() -> str | None:
@@ -107,20 +111,17 @@ def build_phone_camera_config(
     )
 
 
-def open_phone_camera(
+def resolve_phone_url(
     url: str | None = None,
     *,
     user: str | None = None,
     password: str | None = None,
-    **kwargs,
-) -> OpenCVCamera:
-    """Build, connect, and return an OpenCVCamera for the phone stream.
+) -> str:
+    """Resolve the full stream URL (with credentials) from args or .env.
 
     ``url`` falls back to ``$PHONE_CAM_URL`` or the ``$PHONE_CAM_HOST``/``_PORT``/
     ``_PATH`` trio; ``user``/``password`` fall back to ``$PHONE_CAM_USER``/
-    ``$PHONE_CAM_PASS``. All of these can live in the committed ``.env``.
-    Credentials are injected only when the URL has none. Caller is responsible
-    for ``camera.disconnect()``.
+    ``$PHONE_CAM_PASS``. Credentials are injected only when the URL has none.
     """
     url = url or phone_url_from_env()
     if not url:
@@ -128,12 +129,32 @@ def open_phone_camera(
             f"No stream URL provided and neither ${DEFAULT_URL_ENV} nor ${HOST_ENV} "
             "is set (check .env). Pass e.g. 'http://192.168.1.42:8080/video'."
         )
-
     user = user or os.environ.get(USER_ENV)
     password = password or os.environ.get(PASS_ENV)
     if user and password and "@" not in urlsplit(url).netloc:
         url = with_credentials(url, user, password)
+    return url
 
-    camera = OpenCVCamera(build_phone_camera_config(url, **kwargs))
+
+def open_phone_camera(
+    url: str | None = None,
+    *,
+    user: str | None = None,
+    password: str | None = None,
+    fps: int | None = None,
+    width: int | None = None,
+    height: int | None = None,
+    rotation: Cv2Rotation = Cv2Rotation.NO_ROTATION,
+) -> OpenCVCamera:
+    """Build, connect, and return an OpenCVCamera for the phone stream.
+
+    See :func:`resolve_phone_url` for how the URL/credentials are resolved.
+    Caller is responsible for ``camera.disconnect()``.
+    """
+    resolved_url: str = resolve_phone_url(url, user=user, password=password)
+    config: OpenCVCameraConfig = build_phone_camera_config(
+        resolved_url, fps=fps, width=width, height=height, rotation=rotation
+    )
+    camera = OpenCVCamera(config)
     camera.connect()
     return camera

@@ -2,21 +2,22 @@
 
 Run:
     uv run python arm_dashboard.py
-    # then open http://localhost:8000
+    # then open http://localhost:8041
 
-What it does (teleop-first scope):
+What it does:
 - Connect / disconnect the SO-101 follower (robot) + SO-101 leader (teleoperator).
 - Start / stop teleoperation (leader drives follower) in a background thread,
   using LeRobot's canonical loop (get_observation -> get_action -> processors ->
   send_action) from ``lerobot_teleoperate``.
+- Start / stop VLA policy inference: load a Hugging Face policy (pi0, SmolVLA, …),
+  prompt it with a task string, and let it drive the follower (see policy_inference).
 - Live phone-camera preview (the IP Webcam stream from phone_camera.py) as MJPEG.
 - Status polling: connection state, loop FPS, latest joint commands.
 
-Record + inference are intentionally left as clearly-marked TODO hooks — the plan
-is teleop first, those come next.
-
-Configuration comes from .env (see keys below); ports come from
-``uv run lerobot-find-port``. Both arms plug into this computer over USB.
+Teleop and inference are mutually exclusive (both drive the follower).
+Configuration comes from .env (ports via ``uv run lerobot-find-port``); the HF
+token for gated policies comes from gitignored .env.local. Both arms plug into
+this computer over USB.
 """
 
 from __future__ import annotations
@@ -25,38 +26,44 @@ import os
 import secrets
 import threading
 import time
+from collections.abc import Iterator
 from dataclasses import dataclass, field
-from typing import Any
+from typing import Any, Final
 
 import cv2
 import uvicorn
 from fastapi import Depends, FastAPI, HTTPException
 from fastapi.responses import HTMLResponse, JSONResponse, StreamingResponse
 from fastapi.security import HTTPBasic, HTTPBasicCredentials
+from pydantic import BaseModel
 
-# Importing phone_camera also loads .env (it calls load_dotenv on import).
+# Importing phone_camera also loads .env and .env.local (HF_TOKEN) on import.
 from phone_camera import open_phone_camera
 
 # --- Configuration (from .env / environment) --------------------------------
-FOLLOWER_PORT = os.environ.get("FOLLOWER_PORT", "")
-LEADER_PORT = os.environ.get("LEADER_PORT", "")
-FOLLOWER_ID = os.environ.get("ROBOT_ID", "so101_follower")
-LEADER_ID = os.environ.get("LEADER_ID", "so101_leader")
-TELEOP_FPS = int(os.environ.get("TELEOP_FPS", "60"))
-DASHBOARD_PORT = int(os.environ.get("DASHBOARD_PORT", "8041"))
-DASHBOARD_USER = os.environ.get("DASHBOARD_USER", "admin")
-DASHBOARD_PASS = os.environ.get("DASHBOARD_PASS", "")
+FOLLOWER_PORT: Final[str] = os.environ.get("FOLLOWER_PORT", "")
+LEADER_PORT: Final[str] = os.environ.get("LEADER_PORT", "")
+FOLLOWER_ID: Final[str] = os.environ.get("ROBOT_ID", "so101_follower")
+LEADER_ID: Final[str] = os.environ.get("LEADER_ID", "so101_leader")
+TELEOP_FPS: Final[int] = int(os.environ.get("TELEOP_FPS", "60"))
+INFERENCE_FPS: Final[int] = int(os.environ.get("INFERENCE_FPS", "30"))
+DASHBOARD_PORT: Final[int] = int(os.environ.get("DASHBOARD_PORT", "8041"))
+DASHBOARD_USER: Final[str] = os.environ.get("DASHBOARD_USER", "admin")
+DASHBOARD_PASS: Final[str] = os.environ.get("DASHBOARD_PASS", "")
+DEFAULT_POLICY_PATH: Final[str] = os.environ.get("POLICY_PATH", "lerobot/smolvla_base")
+DEFAULT_POLICY_TASK: Final[str] = os.environ.get("POLICY_TASK", "Pick up the cube")
+DEFAULT_POLICY_DEVICE: Final[str] = os.environ.get("POLICY_DEVICE", "")
 
 
 # --- Authentication ---------------------------------------------------------
 # HTTP Basic Auth on every route so only people with the login/password (from
 # .env) can open the dashboard or call the APIs over the network.
-_basic = HTTPBasic()
+_basic: Final[HTTPBasic] = HTTPBasic()
 
 
 def require_auth(credentials: HTTPBasicCredentials = Depends(_basic)) -> str:
-    user_ok = secrets.compare_digest(credentials.username, DASHBOARD_USER)
-    pass_ok = secrets.compare_digest(credentials.password, DASHBOARD_PASS)
+    user_ok: bool = secrets.compare_digest(credentials.username, DASHBOARD_USER)
+    pass_ok: bool = secrets.compare_digest(credentials.password, DASHBOARD_PASS)
     if not (user_ok and pass_ok):
         raise HTTPException(
             status_code=401,
@@ -66,21 +73,27 @@ def require_auth(credentials: HTTPBasicCredentials = Depends(_basic)) -> str:
     return credentials.username
 
 
-AUTH_ENABLED = bool(DASHBOARD_PASS)
-_auth_deps = [Depends(require_auth)] if AUTH_ENABLED else []
+AUTH_ENABLED: Final[bool] = bool(DASHBOARD_PASS)
+_auth_deps: Final[list[Any]] = [Depends(require_auth)] if AUTH_ENABLED else []
 
 
 @dataclass
 class AppState:
+    # lerobot device objects are kept as Any so the dashboard imports without the
+    # (heavy) robot/policy modules and runs on a machine with no arms attached.
     robot: Any = None
     teleop: Any = None
     processors: tuple[Any, Any, Any] | None = None
+    policy_bundle: Any = None
     camera: Any = None
     teleop_thread: threading.Thread | None = None
+    infer_thread: threading.Thread | None = None
     stop_event: threading.Event = field(default_factory=threading.Event)
+    infer_stop: threading.Event = field(default_factory=threading.Event)
     lock: threading.Lock = field(default_factory=threading.Lock)
     fps: float = 0.0
     last_action: dict[str, float] = field(default_factory=dict)
+    inference_status: str = "idle"  # idle | loading | running | error
     error: str | None = None
 
     @property
@@ -96,11 +109,21 @@ class AppState:
     def teleop_running(self) -> bool:
         return self.teleop_thread is not None and self.teleop_thread.is_alive()
 
+    @property
+    def inference_running(self) -> bool:
+        return self.infer_thread is not None and self.infer_thread.is_alive()
 
-state = AppState()
-app = FastAPI(title="SO-101 Arm Dashboard", dependencies=_auth_deps)
+
+state: Final[AppState] = AppState()
+app: Final[FastAPI] = FastAPI(title="SO-101 Arm Dashboard", dependencies=_auth_deps)
 if not AUTH_ENABLED:
     print("WARNING: DASHBOARD_PASS not set in .env -> dashboard is UNAUTHENTICATED.")
+
+
+class InferenceRequest(BaseModel):
+    policy_path: str = DEFAULT_POLICY_PATH
+    task: str = DEFAULT_POLICY_TASK
+    device: str = DEFAULT_POLICY_DEVICE
 
 
 # --- Arm control ------------------------------------------------------------
@@ -128,10 +151,12 @@ def _connect_arms() -> None:
 
 
 def _disconnect_arms() -> None:
-    state.stop_event.set()
-    if state.teleop_thread is not None:
-        state.teleop_thread.join(timeout=3.0)
-        state.teleop_thread = None
+    _stop_thread(state.infer_stop, state.infer_thread)
+    state.infer_thread = None
+    state.inference_status = "idle"
+    state.policy_bundle = None
+    _stop_thread(state.stop_event, state.teleop_thread)
+    state.teleop_thread = None
     for dev in (state.teleop, state.robot):
         try:
             if dev is not None and dev.is_connected:
@@ -139,6 +164,12 @@ def _disconnect_arms() -> None:
         except Exception as e:  # noqa: BLE001 - best-effort cleanup
             state.error = f"disconnect: {e}"
     state.robot = state.teleop = state.processors = None
+
+
+def _stop_thread(event: threading.Event, thread: threading.Thread | None) -> None:
+    event.set()
+    if thread is not None and thread.is_alive():
+        thread.join(timeout=3.0)
 
 
 def _teleop_worker() -> None:
@@ -161,6 +192,31 @@ def _teleop_worker() -> None:
         state.fps = round(1.0 / max(time.perf_counter() - loop_start, 1e-6), 1)
 
 
+def _inference_worker(policy_path: str, task: str, device: str) -> None:
+    # Imported lazily: pulls in torch + the policy stack, which is heavy.
+    from policy_inference import infer_action, load_policy
+
+    try:
+        state.inference_status = "loading"
+        state.error = None
+        bundle = load_policy(policy_path, state.robot, device=device or None)
+        state.policy_bundle = bundle
+        state.inference_status = "running"
+        while not state.infer_stop.is_set():
+            loop_start = time.perf_counter()
+            to_send = infer_action(state.robot, bundle, task)
+            state.robot.send_action(to_send)
+            state.last_action = {k: round(float(v), 2) for k, v in to_send.items()}
+            dt = time.perf_counter() - loop_start
+            time.sleep(max(1.0 / INFERENCE_FPS - dt, 0.0))
+            state.fps = round(1.0 / max(time.perf_counter() - loop_start, 1e-6), 1)
+    except Exception as e:  # noqa: BLE001 - surface to the UI
+        state.error = f"inference: {e}"
+        state.inference_status = "error"
+    else:
+        state.inference_status = "idle"
+
+
 # --- Camera preview ---------------------------------------------------------
 def _get_camera() -> Any:
     if state.camera is None:
@@ -170,7 +226,7 @@ def _get_camera() -> Any:
     return state.camera
 
 
-def _mjpeg_generator():
+def _mjpeg_generator() -> Iterator[bytes]:
     cam = _get_camera()
     while True:
         try:
@@ -196,6 +252,8 @@ def status() -> JSONResponse:
         {
             "connected": state.connected,
             "teleop_running": state.teleop_running,
+            "inference_running": state.inference_running,
+            "inference_status": state.inference_status,
             "fps": state.fps,
             "last_action": state.last_action,
             "error": state.error,
@@ -229,6 +287,8 @@ def disconnect() -> dict[str, str]:
 def teleop_start() -> dict[str, str]:
     if not state.connected:
         raise HTTPException(status_code=400, detail="Connect the arms first.")
+    if state.inference_running:
+        raise HTTPException(status_code=409, detail="Stop inference first.")
     if state.teleop_running:
         return {"status": "already running"}
     state.stop_event.clear()
@@ -239,15 +299,38 @@ def teleop_start() -> dict[str, str]:
 
 @app.post("/teleop/stop")
 def teleop_stop() -> dict[str, str]:
-    state.stop_event.set()
-    if state.teleop_thread is not None:
-        state.teleop_thread.join(timeout=3.0)
-        state.teleop_thread = None
+    _stop_thread(state.stop_event, state.teleop_thread)
+    state.teleop_thread = None
     return {"status": "teleop stopped"}
 
 
+@app.post("/inference/start")
+def inference_start(req: InferenceRequest) -> dict[str, str]:
+    if not state.connected:
+        raise HTTPException(status_code=400, detail="Connect the arms first.")
+    if state.teleop_running:
+        raise HTTPException(status_code=409, detail="Stop teleop first.")
+    if state.inference_running:
+        return {"status": "already running"}
+    state.infer_stop.clear()
+    state.infer_thread = threading.Thread(
+        target=_inference_worker,
+        args=(req.policy_path, req.task, req.device),
+        daemon=True,
+    )
+    state.infer_thread.start()
+    return {"status": "inference starting", "policy": req.policy_path, "task": req.task}
+
+
+@app.post("/inference/stop")
+def inference_stop() -> dict[str, str]:
+    _stop_thread(state.infer_stop, state.infer_thread)
+    state.infer_thread = None
+    state.inference_status = "idle"
+    return {"status": "inference stopped"}
+
+
 # TODO(next): POST /record/start|stop -> wrap lerobot record (LeRobotDataset).
-# TODO(next): POST /inference/start -> load policy and drive follower (lerobot-eval).
 
 
 @app.get("/camera.mjpeg")
@@ -262,22 +345,34 @@ def camera() -> StreamingResponse:
     )
 
 
-INDEX_HTML = """<!doctype html>
+INDEX_HTML: Final[str] = """<!doctype html>
 <html><head><meta charset="utf-8"><title>SO-101 Dashboard</title>
 <style>
   body{font-family:system-ui,sans-serif;margin:24px;background:#0f1115;color:#e6e6e6}
-  h1{font-size:20px} button{font-size:15px;padding:8px 14px;margin:4px;border:0;
-  border-radius:6px;background:#2d6cdf;color:#fff;cursor:pointer}
-  button.stop{background:#c0392b} #cam{max-width:640px;border-radius:8px;background:#000}
+  h1{font-size:20px} h3{margin-bottom:6px}
+  button{font-size:15px;padding:8px 14px;margin:4px;border:0;border-radius:6px;
+  background:#2d6cdf;color:#fff;cursor:pointer} button.stop{background:#c0392b}
+  input{font-size:14px;padding:7px;margin:4px 0;width:340px;border-radius:6px;
+  border:1px solid #333;background:#171a21;color:#e6e6e6}
+  #cam{max-width:640px;border-radius:8px;background:#000}
   pre{background:#171a21;padding:12px;border-radius:8px;max-width:640px;overflow:auto}
   .row{display:flex;gap:24px;flex-wrap:wrap;align-items:flex-start}
+  .card{background:#141821;padding:14px 16px;border-radius:10px;margin-bottom:14px}
 </style></head><body>
 <h1>SO-101 Arm Dashboard</h1>
-<div>
+<div class="card">
   <button onclick="post('/connect')">Connect arms</button>
   <button class="stop" onclick="post('/disconnect')">Disconnect</button>
   <button onclick="post('/teleop/start')">Start teleop</button>
   <button class="stop" onclick="post('/teleop/stop')">Stop teleop</button>
+</div>
+<div class="card">
+  <h3>VLA policy inference</h3>
+  <div>HF policy repo:<br><input id="policy" value="lerobot/smolvla_base"></div>
+  <div>Task prompt:<br><input id="task" value="Pick up the cube"></div>
+  <div>Device (blank = auto):<br><input id="device" placeholder="mps / cuda / cpu"></div>
+  <button onclick="startInfer()">Run inference</button>
+  <button class="stop" onclick="post('/inference/stop')">Stop inference</button>
 </div>
 <div class="row">
   <div><h3>Camera (phone)</h3><img id="cam" src="/camera.mjpeg"
@@ -287,6 +382,13 @@ INDEX_HTML = """<!doctype html>
 <script>
 async function post(p){
   try{const r=await fetch(p,{method:'POST'});
+    if(!r.ok){alert((await r.json()).detail||r.statusText);}}
+  catch(e){alert(e);} refresh();
+}
+async function startInfer(){
+  const body={policy_path:policy.value,task:task.value,device:device.value};
+  try{const r=await fetch('/inference/start',
+    {method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});
     if(!r.ok){alert((await r.json()).detail||r.statusText);}}
   catch(e){alert(e);} refresh();
 }

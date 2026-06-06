@@ -14,6 +14,7 @@ from __future__ import annotations
 import sys
 import time
 from pathlib import Path
+from typing import Final
 
 import cv2
 
@@ -22,8 +23,8 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from phone_camera import open_phone_camera  # noqa: E402
 
-N_FRAMES = 150
-SNAPSHOT_PATH = Path("stream_sample.png")
+N_FRAMES: Final[int] = 150
+SNAPSHOT_PATH: Final[Path] = Path("stream_sample.png")
 
 
 def main() -> int:

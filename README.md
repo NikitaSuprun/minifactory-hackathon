@@ -130,6 +130,62 @@ DASHBOARD_PASS=123123     # leave empty to disable auth (prints a warning)
 > hackathon, but the password is base64 (not encrypted) on the wire. Keep it
 > throwaway.
 
+### Local (single-machine) VLA inference
+
+The dashboard's **Run inference** panel loads a Hugging Face policy *in this
+process* (`policy_inference.py`) and drives the follower from a task prompt. Fine
+for a quick local test on a Mac with a small policy (`lerobot/smolvla_base`);
+heavy VLAs (pi0) want the remote setup below. Gated models need `HF_TOKEN` in
+`.env.local` (gitignored — never commit it).
+
+## 7. Remote (two-machine) VLA inference
+
+For real VLAs, run inference on a GPU box and keep the arm on this Mac, using
+LeRobot's built-in async inference:
+
+```
+Phone ──MJPEG──▶ Mac (run_robot_client.py: reads camera, owns the SO-101)
+                   │
+                   └─gRPC: observations (incl. images) ─▶ GPU box (run_policy_server.py)
+                   ◀─gRPC: action chunks ────────────────┘
+```
+
+**The GPU box never connects to the phone** — the Mac reads the camera locally and
+ships decoded frames over gRPC. So no reverse proxy is needed for the camera. The
+only cross-network link is **Mac → `POLICY_SERVER_ADDRESS`** (the gRPC port). If
+the GPU box is in the cloud / behind NAT, make that port reachable via a public
+IP, **Tailscale/VPN**, or an **SSH tunnel** (simpler than an nginx gRPC proxy):
+
+```bash
+# from the Mac, tunnel local 8080 to the GPU box's 8080:
+ssh -N -L 8080:localhost:8080 user@gpu-box   # then POLICY_SERVER_ADDRESS=localhost:8080
+```
+
+Configure both sides in `.env`:
+
+```dotenv
+POLICY_TYPE=smolvla                 # or pi0, act, …
+POLICY_PATH=lerobot/smolvla_base    # HF repo / checkpoint
+POLICY_TASK=Pick up the cube
+POLICY_SERVER_ADDRESS=192.168.1.50:8080   # GPU box, as seen from the Mac
+SERVER_POLICY_DEVICE=cuda           # device on the GPU box
+CLIENT_DEVICE=cpu                   # device on the Mac
+```
+
+Run it:
+
+```bash
+# On the GPU box (repo cloned, lerobot installed, HF_TOKEN set):
+uv run python run_policy_server.py
+
+# On this Mac (arm + phone camera):
+uv run python run_robot_client.py
+```
+
+`run_robot_client.py` assembles the LeRobot CLI from `.env`, including the phone
+camera (`resolve_phone_url()` injects the IP Webcam credentials). The client tells
+the server which policy to load.
+
 ## Optional: lowest latency over USB
 
 Tether the phone over USB and forward the port with adb, then use `localhost`:
