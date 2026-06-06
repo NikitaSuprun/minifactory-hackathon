@@ -187,6 +187,72 @@ def build_phone_camera_config(
     )
 
 
+def adopt_network_stream_profile() -> None:
+    """Make OpenCVCamera auto-detect resolution/FPS for network (URL) streams.
+
+    A LeRobot *robot* config requires width/height/fps on every camera, so when the
+    phone is used in a robot (not just the dashboard preview) those must be set. But an
+    MJPEG/IP stream is read-only: OpenCV can't change its resolution or FPS, so
+    ``VideoCapture.set`` returns ``False`` and LeRobot's enforcement
+    (``_validate_width_and_height`` / ``_validate_fps``) raises — even when the stream
+    is already at the requested resolution. This patches ``_configure_capture_settings``
+    so a URL-based camera adopts whatever profile the stream actually provides (LeRobot's
+    own behavior when width/height/fps are ``None``) instead of enforcing the declared
+    values. Local (device-index) cameras are untouched. Idempotent; call once before
+    connecting the robot.
+    """
+    if getattr(
+        OpenCVCamera._configure_capture_settings, "_network_stream_patched", False
+    ):
+        return
+
+    original = OpenCVCamera._configure_capture_settings
+
+    def _configure(self) -> None:
+        index = self.index_or_path
+        if isinstance(index, str) and "://" in index:
+            # Read-only stream: drop the declared values so the original method adopts
+            # the stream's actual resolution/FPS and skips the set()-based checks.
+            self.width = self.height = self.fps = None
+        original(self)
+
+    _configure._network_stream_patched = True  # pyright: ignore[reportFunctionMemberAccess]
+    OpenCVCamera._configure_capture_settings = _configure
+
+
+def tolerate_camera_resolution_drift() -> None:
+    """Let an OpenCVCamera accept frames whose size differs from its configured size.
+
+    Some USB cameras report one resolution at connect (so validation passes) but stream a
+    different one (e.g. configured 640x480 yet deliver 640x360), and a few switch modes
+    mid-stream. LeRobot's background read thread rejects mismatched frames
+    (``_postprocess_image`` raises), and after a handful of failures the thread dies — then
+    ``get_observation`` raises and observations are silently dropped, starving the policy
+    server. Since the server resizes every image to the policy's input shape anyway, the
+    exact source size is irrelevant; this patches ``_postprocess_image`` to adopt the
+    frame's actual size on mismatch and accept it instead of raising. Idempotent.
+    """
+    if getattr(OpenCVCamera._postprocess_image, "_resolution_drift_patched", False):
+        return
+
+    original = OpenCVCamera._postprocess_image
+
+    def _postprocess(self, image):
+        try:
+            return original(self, image)
+        except RuntimeError as e:
+            if "do not match configured" not in str(e):
+                raise
+            # Adopt the actual frame size, then re-run (now the size check passes).
+            h, w = image.shape[:2]
+            self.capture_width, self.capture_height = w, h
+            self.width, self.height = w, h
+            return original(self, image)
+
+    _postprocess._resolution_drift_patched = True  # pyright: ignore[reportFunctionMemberAccess]
+    OpenCVCamera._postprocess_image = _postprocess
+
+
 def resolve_phone_url(
     url: str | None = None,
     *,

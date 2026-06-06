@@ -106,6 +106,9 @@ class AppState:
     teleop_thread: threading.Thread | None = None
     stop_event: threading.Event = field(default_factory=threading.Event)
     lock: threading.Lock = field(default_factory=threading.Lock)
+    # Serializes wrist-cam read() against release() so freeing it (on inference start)
+    # can't race a concurrent read in the preview generator and segfault OpenCV.
+    wrist_cam_lock: threading.Lock = field(default_factory=threading.Lock)
     infer_proc: subprocess.Popen[bytes] | None = None
     infer_task: str = DEFAULT_POLICY_TASK
     inference_status: str = "idle"  # idle | running | error
@@ -183,12 +186,14 @@ def _stop_teleop_thread() -> None:
 
 
 def _release_wrist_cam() -> None:
-    if state.wrist_cam is not None:
-        try:
-            state.wrist_cam.release()
-        except Exception:  # noqa: BLE001 - best-effort
-            pass
-        state.wrist_cam = None
+    # Hold wrist_cam_lock so we never release while the preview generator is mid-read().
+    with state.wrist_cam_lock:
+        if state.wrist_cam is not None:
+            try:
+                state.wrist_cam.release()
+            except Exception:  # noqa: BLE001 - best-effort
+                pass
+            state.wrist_cam = None
 
 
 def _disconnect_arms() -> None:
@@ -388,10 +393,16 @@ def _mjpeg_generator() -> Iterator[bytes]:
 
 
 def _wrist_mjpeg_generator() -> Iterator[bytes]:
-    cap = _get_wrist_cam()
+    _get_wrist_cam()  # open it (if needed) before streaming
     times: list[float] = []
     while True:
-        ok, frame = cap.read()  # already BGR
+        # Read under the lock and re-fetch each iteration: if inference released the
+        # cam, state.wrist_cam is None and we stop instead of reading freed memory.
+        with state.wrist_cam_lock:
+            cap = state.wrist_cam
+            if cap is None:
+                return
+            ok, frame = cap.read()  # already BGR
         if not ok:
             time.sleep(0.05)
             continue

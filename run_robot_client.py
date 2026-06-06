@@ -6,24 +6,36 @@ assembles the long lerobot CLI from .env, including the phone camera URL.
 
     uv run python run_robot_client.py
 
-Equivalent to:
-    python -m lerobot.async_inference.robot_client \
-        --robot.type=so101_follower --robot.port=... --robot.id=... \
-        --robot.cameras="{phone: {type: opencv, index_or_path: <url>}}" \
-        --task=... --server_address=HOST:PORT \
-        --policy_type=... --pretrained_name_or_path=... \
-        --policy_device=cuda --client_device=cpu
+This builds LeRobot's RobotClientConfig in-process rather than shelling out to the
+`lerobot.async_inference.robot_client` CLI. The CLI routes `--robot.cameras` through
+draccus, which decodes `index_or_path` (typed `int | Path`) by calling `Path(url)` and
+collapses `http://` to `http:/`, corrupting the phone stream URL. Constructing the config
+here keeps the URL a plain string (via `build_phone_camera_config`) and leaves the phone
+camera's width/height/fps unset so LeRobot auto-detects the stream instead of trying
+`VideoCapture.set` on a network stream (which raises). See phone_camera.py.
 """
 
 from __future__ import annotations
 
-import json
 import os
 import sys
+import threading
 from pathlib import Path
 from typing import Final
 
-from phone_camera import resolve_phone_url
+from lerobot.async_inference.configs import RobotClientConfig
+from lerobot.async_inference.robot_client import RobotClient
+from lerobot.cameras.configs import CameraConfig
+from lerobot.cameras.opencv import OpenCVCameraConfig
+from lerobot.robots.so_follower.config_so_follower import SO101FollowerConfig
+from lerobot.utils.import_utils import register_third_party_plugins
+
+from phone_camera import (
+    adopt_network_stream_profile,
+    build_phone_camera_config,
+    resolve_phone_url,
+    tolerate_camera_resolution_drift,
+)
 
 _HERE: Final[Path] = Path(__file__).resolve().parent
 CALIBRATION_DIR: Final[str] = os.environ.get("CALIBRATION_DIR") or str(
@@ -41,12 +53,18 @@ CLIENT_DEVICE: Final[str] = os.environ.get("CLIENT_DEVICE", "cpu")
 ACTIONS_PER_CHUNK: Final[str] = os.environ.get("ACTIONS_PER_CHUNK", "50")
 CHUNK_SIZE_THRESHOLD: Final[str] = os.environ.get("CHUNK_SIZE_THRESHOLD", "0.5")
 AGGREGATE_FN: Final[str] = os.environ.get("AGGREGATE_FN", "weighted_average")
-PHONE_CAMERA_NAME: Final[str] = os.environ.get("ROBOT_CAMERA_NAME", "phone")
+# A LeRobot robot config requires width/height/fps on every camera, so set them to
+# match what the IP Webcam app emits. The phone is a network MJPEG stream whose
+# resolution can't actually be changed via OpenCV — allow_network_stream_resolution()
+# (below) lets LeRobot accept these values instead of failing on VideoCapture.set.
+# Camera names become the policy-facing image-feature slots (observation.images.<name>);
+# they must match the loaded policy's expected keys. smolvla_base uses camera1/camera2/camera3.
+PHONE_CAMERA_NAME: Final[str] = os.environ.get("ROBOT_CAMERA_NAME", "camera1")
 PHONE_CAM_WIDTH: Final[str] = os.environ.get("PHONE_CAM_WIDTH", "640")
 PHONE_CAM_HEIGHT: Final[str] = os.environ.get("PHONE_CAM_HEIGHT", "480")
 PHONE_CAM_FPS: Final[str] = os.environ.get("PHONE_CAM_FPS", "30")
 ARM_CAM_INDEX: Final[str] = os.environ.get("ARM_CAM_INDEX", "")
-ARM_CAM_NAME: Final[str] = os.environ.get("ARM_CAM_NAME", "wrist")
+ARM_CAM_NAME: Final[str] = os.environ.get("ARM_CAM_NAME", "camera2")
 ARM_CAM_WIDTH: Final[str] = os.environ.get("ARM_CAM_WIDTH", "640")
 ARM_CAM_HEIGHT: Final[str] = os.environ.get("ARM_CAM_HEIGHT", "480")
 ARM_CAM_FPS: Final[str] = os.environ.get("ARM_CAM_FPS", "30")
@@ -58,50 +76,64 @@ def main() -> None:
     if not SERVER_ADDRESS:
         sys.exit("POLICY_SERVER_ADDRESS is not set in .env (e.g. 192.168.1.50:8080).")
 
-    # Cameras sent to the policy: the phone stream (URL) and, if present, the USB
-    # wrist camera (device index, configured to a modest resolution).
-    # Unlike the dashboard (which auto-detects the stream profile), a robot
-    # config requires width/height/fps on every camera, so set them explicitly
-    # to match what the IP Webcam app emits (see PHONE_CAM_* in .env).
-    cameras: dict[str, dict[str, str | int]] = {
-        PHONE_CAMERA_NAME: {
-            "type": "opencv",
-            "index_or_path": resolve_phone_url(),
-            "width": int(PHONE_CAM_WIDTH),
-            "height": int(PHONE_CAM_HEIGHT),
-            "fps": int(PHONE_CAM_FPS),
-        },
+    # Cameras sent to the policy: the phone stream (URL, kept as a string so the URL
+    # survives intact) and, if present, the USB wrist camera (device index). The dict keys
+    # are the policy's observation.images.<key> slots (see PHONE_CAMERA_NAME/ARM_CAM_NAME).
+    # Both carry width/height/fps (required by the robot config); the patches below let the
+    # phone's read-only network stream adopt its actual profile, and any camera tolerate a
+    # delivered frame size that differs from the configured one (e.g. the wrist's 640x360).
+    adopt_network_stream_profile()
+    tolerate_camera_resolution_drift()
+    cameras: dict[str, CameraConfig] = {
+        PHONE_CAMERA_NAME: build_phone_camera_config(
+            resolve_phone_url(),
+            width=int(PHONE_CAM_WIDTH),
+            height=int(PHONE_CAM_HEIGHT),
+            fps=int(PHONE_CAM_FPS),
+        )
     }
     if ARM_CAM_INDEX != "":
-        cameras[ARM_CAM_NAME] = {
-            "type": "opencv",
-            "index_or_path": int(ARM_CAM_INDEX),
-            "width": int(ARM_CAM_WIDTH),
-            "height": int(ARM_CAM_HEIGHT),
-            "fps": int(ARM_CAM_FPS),
-        }
+        cameras[ARM_CAM_NAME] = OpenCVCameraConfig(
+            index_or_path=int(ARM_CAM_INDEX),
+            width=int(ARM_CAM_WIDTH),
+            height=int(ARM_CAM_HEIGHT),
+            fps=int(ARM_CAM_FPS),
+        )
 
-    argv: list[str] = [
-        sys.executable,
-        "-m",
-        "lerobot.async_inference.robot_client",
-        "--robot.type=so101_follower",
-        f"--robot.port={FOLLOWER_PORT}",
-        f"--robot.id={ROBOT_ID}",
-        f"--robot.calibration_dir={CALIBRATION_DIR}",
-        f"--robot.cameras={json.dumps(cameras)}",
-        f"--task={POLICY_TASK}",
-        f"--server_address={SERVER_ADDRESS}",
-        f"--policy_type={POLICY_TYPE}",
-        f"--pretrained_name_or_path={POLICY_PATH}",
-        f"--policy_device={SERVER_POLICY_DEVICE}",
-        f"--client_device={CLIENT_DEVICE}",
-        f"--actions_per_chunk={ACTIONS_PER_CHUNK}",
-        f"--chunk_size_threshold={CHUNK_SIZE_THRESHOLD}",
-        f"--aggregate_fn_name={AGGREGATE_FN}",
-    ]
-    print("launching:", " ".join(argv))
-    os.execvp(argv[0], argv)
+    robot_cfg = SO101FollowerConfig(
+        port=FOLLOWER_PORT,
+        id=ROBOT_ID,
+        calibration_dir=Path(CALIBRATION_DIR),
+        cameras=cameras,
+        use_degrees=True,
+    )
+    client_cfg = RobotClientConfig(
+        robot=robot_cfg,
+        task=POLICY_TASK,
+        server_address=SERVER_ADDRESS,
+        policy_type=POLICY_TYPE,
+        pretrained_name_or_path=POLICY_PATH,
+        policy_device=SERVER_POLICY_DEVICE,
+        client_device=CLIENT_DEVICE,
+        actions_per_chunk=int(ACTIONS_PER_CHUNK),
+        chunk_size_threshold=float(CHUNK_SIZE_THRESHOLD),
+        aggregate_fn_name=AGGREGATE_FN,
+    )
+
+    # Mirrors lerobot.async_inference.robot_client's CLI entrypoint (async_client):
+    # connect, run the action-receiver thread, drive the control loop, then tear down.
+    register_third_party_plugins()
+    client = RobotClient(client_cfg)
+    if not client.start():
+        sys.exit("RobotClient failed to start (policy-server handshake failed).")
+
+    action_receiver = threading.Thread(target=client.receive_actions, daemon=True)
+    action_receiver.start()
+    try:
+        client.control_loop(task=client_cfg.task)
+    finally:
+        client.stop()
+        action_receiver.join()
 
 
 if __name__ == "__main__":
