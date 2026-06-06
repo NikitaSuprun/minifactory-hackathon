@@ -7,6 +7,24 @@ dataset recording.
 The phone runs the **IP Webcam** app and serves an MJPEG stream; LeRobot's
 `OpenCVCamera` opens that URL directly — no macOS driver or virtual camera needed.
 
+## Quickstart (start everything)
+
+Three pieces — phone, GPU box (inference), Mac (arms + dashboard). Run `make` to
+see all commands.
+
+1. **Phone:** open **IP Webcam** → Start server (must be on the same WiFi as the Mac).
+2. **GPU box (once / when needed):** `make server-deploy` — deploys + starts the
+   policy server on the 3090 over Tailscale. It stays running.
+3. **Mac:** plug in both SO-101 arms, then `make dashboard` → open
+   **http://localhost:8041** (login `admin` / `123123`).
+   - **Connect arms** → **Start teleop** (leader drives follower), or
+   - **Run inference** → the dashboard launches the remote client; the policy on the
+     GPU box drives the follower from the phone + wrist cameras.
+
+First time only: `make find-port` (set ports in `.env`) and calibrate
+(`make calibrate-follower` / `make calibrate-leader`) — though calibration is already
+committed for our arms.
+
 ## 1. Phone setup (IP Webcam)
 
 1. Install **IP Webcam** (by Pavel Khlebovich) from the Play Store.
