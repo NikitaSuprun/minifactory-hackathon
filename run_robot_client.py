@@ -42,6 +42,9 @@ ACTIONS_PER_CHUNK: Final[str] = os.environ.get("ACTIONS_PER_CHUNK", "50")
 CHUNK_SIZE_THRESHOLD: Final[str] = os.environ.get("CHUNK_SIZE_THRESHOLD", "0.5")
 AGGREGATE_FN: Final[str] = os.environ.get("AGGREGATE_FN", "weighted_average")
 PHONE_CAMERA_NAME: Final[str] = os.environ.get("ROBOT_CAMERA_NAME", "phone")
+PHONE_CAM_WIDTH: Final[str] = os.environ.get("PHONE_CAM_WIDTH", "640")
+PHONE_CAM_HEIGHT: Final[str] = os.environ.get("PHONE_CAM_HEIGHT", "480")
+PHONE_CAM_FPS: Final[str] = os.environ.get("PHONE_CAM_FPS", "30")
 ARM_CAM_INDEX: Final[str] = os.environ.get("ARM_CAM_INDEX", "")
 ARM_CAM_NAME: Final[str] = os.environ.get("ARM_CAM_NAME", "wrist")
 ARM_CAM_WIDTH: Final[str] = os.environ.get("ARM_CAM_WIDTH", "640")
@@ -57,8 +60,17 @@ def main() -> None:
 
     # Cameras sent to the policy: the phone stream (URL) and, if present, the USB
     # wrist camera (device index, configured to a modest resolution).
+    # Unlike the dashboard (which auto-detects the stream profile), a robot
+    # config requires width/height/fps on every camera, so set them explicitly
+    # to match what the IP Webcam app emits (see PHONE_CAM_* in .env).
     cameras: dict[str, dict[str, str | int]] = {
-        PHONE_CAMERA_NAME: {"type": "opencv", "index_or_path": resolve_phone_url()},
+        PHONE_CAMERA_NAME: {
+            "type": "opencv",
+            "index_or_path": resolve_phone_url(),
+            "width": int(PHONE_CAM_WIDTH),
+            "height": int(PHONE_CAM_HEIGHT),
+            "fps": int(PHONE_CAM_FPS),
+        },
     }
     if ARM_CAM_INDEX != "":
         cameras[ARM_CAM_NAME] = {
