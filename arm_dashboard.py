@@ -27,10 +27,11 @@ import subprocess
 import sys
 import threading
 import time
+from collections import deque
 from collections.abc import Iterator
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Final, Literal, cast, get_args
+from typing import Any, Final, Literal
 
 import cv2
 import numpy as np
@@ -184,7 +185,6 @@ RecordStatus = Literal[
     "done",
     "error",
 ]
-_RECORD_STATUSES: Final[frozenset[str]] = frozenset(get_args(RecordStatus))
 
 
 class InferenceRequest(BaseModel):
@@ -288,13 +288,30 @@ def _start_teleop_thread() -> None:
     state.teleop_thread.start()
 
 
+# camera_lock.active() opens the lockfile; cache it briefly so the per-frame preview
+# checks (×3 streams) don't turn into a hot-path file read. The TTL is well under any
+# human-perceptible lag in resuming/pausing previews.
+_lock_active: bool = False
+_lock_active_at: float = 0.0
+_LOCK_ACTIVE_TTL_S: Final[float] = 0.5
+
+
+def _camera_lock_active() -> bool:
+    global _lock_active, _lock_active_at
+    now = time.perf_counter()
+    if now - _lock_active_at >= _LOCK_ACTIVE_TTL_S:
+        _lock_active = camera_lock.active()
+        _lock_active_at = now
+    return _lock_active
+
+
 def inference_active() -> bool:
     """True when the model owns the cameras: our own inference subprocess is running,
     or another process (e.g. an external ``run_robot_client.py``) holds the camera lock.
 
     In-process recording does NOT set this — it reuses the connected robot's cameras, so
     previews stay live during recording."""
-    return state.inference_running or camera_lock.active()
+    return state.inference_running or _camera_lock_active()
 
 
 def _disconnect_arms() -> None:
@@ -390,11 +407,14 @@ def _set_record_status(status: RecordStatus) -> None:
 
 
 def _on_record_phase(
-    phase: str, *, current_episode: int, total_episodes: int, phase_time_s: float
+    phase: Literal["recording", "resetting"],
+    *,
+    current_episode: int,
+    total_episodes: int,
+    phase_time_s: float,
 ) -> None:
     """Callback from run_record_session at the start of each recording / reset window."""
-    if phase in _RECORD_STATUSES:
-        state.record_status = cast(RecordStatus, phase)
+    state.record_status = phase
     state.record_current_episode = current_episode
     state.record_total_episodes = total_episodes
     state.record_phase_started_at = time.time()
@@ -494,7 +514,7 @@ def _stop_recording() -> None:
             _set_record_status("finalizing")
 
 
-def _record_event(event: str) -> None:
+def _record_event(event: Literal["end_episode", "rerecord"]) -> None:
     if state.record_events is None:
         return
     if event == "end_episode":
@@ -569,20 +589,25 @@ def _server_reachable() -> bool:
 
 
 # --- Camera previews --------------------------------------------------------
-def _tick_fps(times: list[float]) -> float:
+# Cap the preview encode/stream rate. Cameras publish at ~30 FPS, so peeking faster
+# just re-encodes the same buffered frame; this bounds CPU + bandwidth across the 3 tiles.
+PREVIEW_FPS: Final[int] = 30
+
+
+def _tick_fps(times: deque[float]) -> float:
     """Append now to a rolling 1s window; return frames in the last second (~FPS)."""
     now = time.perf_counter()
     times.append(now)
     cutoff = now - 1.0
     while times and times[0] < cutoff:
-        times.pop(0)
+        times.popleft()
     return float(len(times))
 
 
 _PLACEHOLDER_CACHE: dict[str, bytes] = {}
 
 
-def _placeholder_jpeg(label: str, reason: str) -> bytes:
+def _placeholder_jpeg(label: str, reason: Literal["busy", "disconnected"]) -> bytes:
     """Cached gray JPEG shown in a tile when no live frame is available.
 
     ``reason`` is ``"busy"`` (the model owns the cameras during inference) or
@@ -631,9 +656,15 @@ def _camera_mjpeg(cam_name: str) -> Iterator[bytes]:
     Reads via ``read_latest()`` — a lock-guarded non-blocking peek — so the preview runs
     safely *concurrently* with ``record_loop``'s ``get_observation()`` on the same camera
     (both peek the same buffered frame). Shows a placeholder while the model owns the cameras
-    (inference) or the arms aren't connected; the stream stays open so it resumes live."""
-    times: list[float] = []
+    (inference) or the arms aren't connected; the stream stays open so it resumes live.
+
+    Capped at ``PREVIEW_FPS`` and skips re-encoding when the camera hasn't produced a new
+    frame (``read_latest`` returns the same object until the reader publishes a fresh one), so
+    we don't burn CPU/bandwidth re-sending duplicate frames or inflate the reported FPS."""
+    times: deque[float] = deque()
+    last_frame: Any = None
     while True:
+        loop_start = time.perf_counter()
         if inference_active():
             yield _mjpeg_chunk(_placeholder_jpeg(cam_name, "busy"))
             time.sleep(0.3)
@@ -648,12 +679,17 @@ def _camera_mjpeg(cam_name: str) -> Iterator[bytes]:
         except Exception:  # noqa: BLE001 - stale/no frame or mid-disconnect; keep streaming
             time.sleep(0.05)
             continue
+        if frame_rgb is last_frame:  # no new frame yet — don't re-encode/re-send
+            time.sleep(1.0 / PREVIEW_FPS)
+            continue
+        last_frame = frame_rgb
         ok, jpg = cv2.imencode(".jpg", cv2.cvtColor(frame_rgb, cv2.COLOR_RGB2BGR))
         if not ok:
             continue
         state.cam_fps[cam_name] = _tick_fps(times)
         state.cam_fps_at[cam_name] = time.perf_counter()
         yield _mjpeg_chunk(jpg.tobytes())
+        time.sleep(max(1.0 / PREVIEW_FPS - (time.perf_counter() - loop_start), 0.0))
 
 
 # --- Routes -----------------------------------------------------------------

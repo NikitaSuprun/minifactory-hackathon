@@ -62,7 +62,7 @@ class Car:
     # threads), so every caller just enqueues and the single writer does os.write.
     _q: queue.Queue = field(default_factory=queue.Queue, repr=False)
     _stop_tx: threading.Event = field(default_factory=threading.Event, repr=False)
-    _writer: Any = field(default=None, repr=False)
+    _writer: threading.Thread | None = field(default=None, repr=False)
     last_send_error: str | None = None
 
     def __post_init__(self) -> None:

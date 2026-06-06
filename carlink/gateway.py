@@ -25,14 +25,14 @@ import json
 import queue
 import threading
 import time
-from typing import Optional
+from typing import Any
 
 from atech import Action, Board, Event
 
 GATEWAY_HOST = "gateway.atech.dev"
 
 
-def _wire_value(value) -> str:
+def _wire_value(value: Any) -> str:
     """Stringify an action value for firmware that reads value as char*."""
     if value is None:
         return ""
@@ -43,7 +43,7 @@ def _wire_value(value) -> str:
     return json.dumps(value, separators=(",", ":"))
 
 
-def _event_from_payload(payload: dict) -> Optional[Event]:
+def _event_from_payload(payload: dict[str, Any]) -> Event | None:
     """Build an atech.Event from a gateway device_event payload (mirrors the
     official serial parser: type=event_type, module_type=source)."""
     event_type = payload.get("event_type")
@@ -81,7 +81,7 @@ class GatewayTransport:
         self._latest: dict[str, Event] = {}
         self._lock = threading.Lock()
         self.connected_devices = False
-        self.last_error: Optional[str] = None
+        self.last_error: str | None = None
         self._stop = threading.Event()
         self._thread = threading.Thread(
             target=self._reader, name="atech-gw", daemon=True
@@ -140,19 +140,19 @@ class GatewayTransport:
         }
         self._ws.send(json.dumps(frame, separators=(",", ":")))
 
-    def recv(self, timeout: Optional[float] = None) -> Optional[Event]:
+    def recv(self, timeout: float | None = None) -> Event | None:
         try:
             return self._q.get(timeout=timeout) if timeout else self._q.get_nowait()
         except queue.Empty:
             return None
 
-    def latest(self, key: str) -> Optional[Event]:
+    def latest(self, key: str) -> Event | None:
         with self._lock:
             return self._latest.get(key)
 
     def boot_report(
         self, *, reset: bool = True, timeout: float = 5.0
-    ) -> Optional[dict]:
+    ) -> dict[str, Any] | None:
         return None  # no boot diagnostics over the gateway
 
     def close(self) -> None:

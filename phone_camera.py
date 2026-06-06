@@ -29,10 +29,11 @@ import os
 import shutil
 import subprocess
 from pathlib import Path
-from typing import Final
+from typing import Any, Final
 from urllib.parse import quote, urlsplit, urlunsplit
 
 from dotenv import load_dotenv
+from numpy.typing import NDArray
 
 from lerobot.cameras.configs import Cv2Rotation
 from lerobot.cameras.opencv import OpenCVCamera, OpenCVCameraConfig
@@ -237,7 +238,7 @@ def tolerate_camera_resolution_drift() -> None:
 
     original = OpenCVCamera._postprocess_image
 
-    def _postprocess(self, image):
+    def _postprocess(self, image: NDArray[Any]) -> NDArray[Any]:
         try:
             return original(self, image)
         except RuntimeError as e:

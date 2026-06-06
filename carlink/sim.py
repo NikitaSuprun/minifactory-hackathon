@@ -20,14 +20,20 @@ from __future__ import annotations
 import json
 import threading
 import time
+from typing import Any, Literal
 
 from atech import Board, MockTransport
 
 MODULES = ("vl53l5cx", "imu", "fl", "fr", "rl", "rr")
 
 
-def _wire(event_type: str, key: str, value, source: str | None = None) -> str:
-    payload = {"event_type": event_type, "key": key, "value": value}
+def _wire(
+    event_type: Literal["state", "sensor", "event"],
+    key: str,
+    value: Any,
+    source: str | None = None,
+) -> str:
+    payload: dict[str, Any] = {"event_type": event_type, "key": key, "value": value}
     if source:
         payload["source"] = source
     return json.dumps({"type": "event", "payload": payload})

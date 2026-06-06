@@ -24,6 +24,7 @@ import secrets
 import sys
 import threading
 import time
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -35,6 +36,7 @@ from fastapi.security import HTTPBasic, HTTPBasicCredentials
 
 from carlink import (
     Car,
+    Policy,
     PolicyRunner,
     StraightUntilObstacle,
     connect_gateway,
@@ -58,7 +60,7 @@ DASHBOARD_USER = os.environ.get("DASHBOARD_USER", "admin")
 DASHBOARD_PASS = os.environ.get("DASHBOARD_PASS", "")
 
 # Selectable policies: name -> factory(**params). Add your own driving policies here.
-POLICIES: dict[str, Any] = {
+POLICIES: dict[str, Callable[..., Policy]] = {
     "straight_until_obstacle": lambda **kw: StraightUntilObstacle(
         speed=int(kw.get("speed", 150)),
         stop_distance_mm=float(kw.get("stop_distance_mm", 300)),
