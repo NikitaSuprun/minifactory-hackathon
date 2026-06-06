@@ -5,6 +5,7 @@ description = "Add your description here"
 readme = "README.md"
 requires-python = ">=3.12"
 dependencies = [
+    "depthai>=3.6.1",
     "fastapi>=0.136.3",
     "lerobot[feetech,grpcio-dep,smolvla]>=0.5.1",
     "opencv-python-headless>=4.13.0.92",

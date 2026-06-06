@@ -71,6 +71,8 @@ ARM_CAM_HEIGHT: Final[int] = int(os.environ.get("ARM_CAM_HEIGHT", "480"))
 CAM3_INDEX: Final[str] = os.environ.get("CAM3_INDEX", "")
 CAM3_WIDTH: Final[int] = int(os.environ.get("CAM3_WIDTH", "640"))
 CAM3_HEIGHT: Final[int] = int(os.environ.get("CAM3_HEIGHT", "480"))
+# "opencv" (cv2 device index) or "oak" (Luxonis depthai device, e.g. OAK-D Lite).
+CAM3_SOURCE: Final[str] = os.environ.get("CAM3_SOURCE", "opencv").strip().lower()
 CLIENT_LOG: Final[Path] = _HERE / "logs" / "client.out"
 SERVER_LOG_REMOTE: Final[str] = "~/minifactory-hackathon/policy_server.out"
 # Built Vite SPA (committed). Served when present; otherwise the inline HTML below.
@@ -394,19 +396,33 @@ def _get_wrist_cam() -> Any:
     return state.wrist_cam
 
 
-def _get_cam3() -> Any:
+def _open_cam3() -> Any:
+    # OAK-D (depthai) is an XLink device with no OpenCV index, so it needs its own
+    # VideoCapture-like source; otherwise fall back to a plain cv2 device index.
+    if CAM3_SOURCE == "oak":
+        from oak_camera import OakCamera
+
+        cap = OakCamera(width=CAM3_WIDTH, height=CAM3_HEIGHT)
+        if not cap.isOpened():
+            cap.release()
+            raise RuntimeError("failed to open OAK camera (cam3)")
+        return cap
     if not CAM3_INDEX:
         raise RuntimeError("CAM3_INDEX is not set in .env")
+    cap = cv2.VideoCapture(int(CAM3_INDEX))
+    cap.set(cv2.CAP_PROP_FRAME_WIDTH, CAM3_WIDTH)
+    cap.set(cv2.CAP_PROP_FRAME_HEIGHT, CAM3_HEIGHT)
+    if not cap.isOpened():
+        cap.release()
+        raise RuntimeError(f"failed to open cam3 index {CAM3_INDEX}")
+    return cap
+
+
+def _get_cam3() -> Any:
     if state.cam3 is None:
         with state.lock:
             if state.cam3 is None:
-                cap = cv2.VideoCapture(int(CAM3_INDEX))
-                cap.set(cv2.CAP_PROP_FRAME_WIDTH, CAM3_WIDTH)
-                cap.set(cv2.CAP_PROP_FRAME_HEIGHT, CAM3_HEIGHT)
-                if not cap.isOpened():
-                    cap.release()
-                    raise RuntimeError(f"failed to open cam3 index {CAM3_INDEX}")
-                state.cam3 = cap
+                state.cam3 = _open_cam3()
     return state.cam3
 
 
