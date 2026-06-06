@@ -153,8 +153,26 @@ Phone ──MJPEG──▶ Mac (run_robot_client.py: reads camera, owns the SO-1
 **The GPU box never connects to the phone** — the Mac reads the camera locally and
 ships decoded frames over gRPC. So no reverse proxy is needed for the camera. The
 only cross-network link is **Mac → `POLICY_SERVER_ADDRESS`** (the gRPC port). If
-the GPU box is in the cloud / behind NAT, make that port reachable via a public
-IP, **Tailscale/VPN**, or an **SSH tunnel** (simpler than an nginx gRPC proxy):
+the GPU box is in the cloud / behind NAT, make that port reachable one of two ways.
+
+**Option A — Tailscale (recommended).** A mesh VPN giving both machines stable
+`100.x` IPs through NAT; no tunnel needed.
+
+```bash
+# This Mac:
+brew install --cask tailscale            # then open the app, log in, Connect
+/Applications/Tailscale.app/Contents/MacOS/Tailscale ip -4
+
+# GPU box (Linux), same Tailscale account:
+curl -fsSL https://tailscale.com/install.sh | sh
+sudo tailscale up
+tailscale ip -4                          # -> use this as POLICY_SERVER_ADDRESS host
+```
+
+Then set `POLICY_SERVER_ADDRESS=<gpu-tailscale-ip>:8080` and run the server/client
+directly — no `run_tunnel.py`.
+
+**Option B — SSH tunnel.** If you can't use Tailscale, forward the port over SSH:
 
 ```bash
 # helper: reads GPU_SSH_HOST / TUNNEL_LOCAL_PORT from .env and forwards the port
