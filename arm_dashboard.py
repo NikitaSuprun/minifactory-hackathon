@@ -162,6 +162,23 @@ class InferenceRequest(BaseModel):
 
 
 # --- Arm control ------------------------------------------------------------
+def _connect_no_prompt(dev: Any) -> None:
+    """Connect a follower/leader without lerobot's interactive calibration prompt.
+
+    lerobot's ``connect()`` re-runs ``calibrate()`` whenever the motors' stored
+    calibration doesn't match the committed file (e.g. after a power-cycle). With
+    a file present that path blocks on ``input()`` ("Press ENTER to use provided
+    calibration file...") — invisible from the browser, so Connect appears to
+    hang. We pass ``calibrate=False`` to skip the prompt, then replicate the
+    ENTER path ourselves: write the committed calibration straight to the motors.
+    ``configure()`` (run inside ``connect``) only touches operating-mode/PID
+    registers, so writing calibration afterwards is equivalent and safe.
+    """
+    dev.connect(calibrate=False)
+    if not dev.is_calibrated and dev.calibration:
+        dev.bus.write_calibration(dev.calibration)
+
+
 def _connect_arms() -> None:
     # Imported lazily so the dashboard/camera still run on a machine with no arms.
     from lerobot.processor import make_default_processors
@@ -182,8 +199,8 @@ def _connect_arms() -> None:
     teleop = SO101Leader(
         SO101LeaderConfig(port=LEADER_PORT, id=LEADER_ID, calibration_dir=CALIB_DIR)
     )
-    robot.connect()
-    teleop.connect()
+    _connect_no_prompt(robot)
+    _connect_no_prompt(teleop)
 
     state.robot = robot
     state.teleop = teleop
