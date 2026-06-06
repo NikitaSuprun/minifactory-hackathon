@@ -41,7 +41,12 @@ CLIENT_DEVICE: Final[str] = os.environ.get("CLIENT_DEVICE", "cpu")
 ACTIONS_PER_CHUNK: Final[str] = os.environ.get("ACTIONS_PER_CHUNK", "50")
 CHUNK_SIZE_THRESHOLD: Final[str] = os.environ.get("CHUNK_SIZE_THRESHOLD", "0.5")
 AGGREGATE_FN: Final[str] = os.environ.get("AGGREGATE_FN", "weighted_average")
-CAMERA_NAME: Final[str] = os.environ.get("ROBOT_CAMERA_NAME", "phone")
+PHONE_CAMERA_NAME: Final[str] = os.environ.get("ROBOT_CAMERA_NAME", "phone")
+ARM_CAM_INDEX: Final[str] = os.environ.get("ARM_CAM_INDEX", "")
+ARM_CAM_NAME: Final[str] = os.environ.get("ARM_CAM_NAME", "wrist")
+ARM_CAM_WIDTH: Final[str] = os.environ.get("ARM_CAM_WIDTH", "640")
+ARM_CAM_HEIGHT: Final[str] = os.environ.get("ARM_CAM_HEIGHT", "480")
+ARM_CAM_FPS: Final[str] = os.environ.get("ARM_CAM_FPS", "30")
 
 
 def main() -> None:
@@ -50,9 +55,19 @@ def main() -> None:
     if not SERVER_ADDRESS:
         sys.exit("POLICY_SERVER_ADDRESS is not set in .env (e.g. 192.168.1.50:8080).")
 
-    cameras: dict[str, dict[str, str]] = {
-        CAMERA_NAME: {"type": "opencv", "index_or_path": resolve_phone_url()}
+    # Cameras sent to the policy: the phone stream (URL) and, if present, the USB
+    # wrist camera (device index, configured to a modest resolution).
+    cameras: dict[str, dict[str, str | int]] = {
+        PHONE_CAMERA_NAME: {"type": "opencv", "index_or_path": resolve_phone_url()},
     }
+    if ARM_CAM_INDEX != "":
+        cameras[ARM_CAM_NAME] = {
+            "type": "opencv",
+            "index_or_path": int(ARM_CAM_INDEX),
+            "width": int(ARM_CAM_WIDTH),
+            "height": int(ARM_CAM_HEIGHT),
+            "fps": int(ARM_CAM_FPS),
+        }
 
     argv: list[str] = [
         sys.executable,

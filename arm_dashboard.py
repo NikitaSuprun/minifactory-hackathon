@@ -58,6 +58,10 @@ DEFAULT_POLICY_DEVICE: Final[str] = os.environ.get("POLICY_DEVICE", "")
 CALIB_DIR: Final[Path] = Path(
     os.environ.get("CALIBRATION_DIR") or Path(__file__).resolve().parent / "calibration"
 )
+# USB wrist camera (OpenCV device index); blank disables the wrist preview.
+ARM_CAM_INDEX: Final[str] = os.environ.get("ARM_CAM_INDEX", "")
+ARM_CAM_WIDTH: Final[int] = int(os.environ.get("ARM_CAM_WIDTH", "640"))
+ARM_CAM_HEIGHT: Final[int] = int(os.environ.get("ARM_CAM_HEIGHT", "480"))
 
 
 # --- Authentication ---------------------------------------------------------
@@ -91,6 +95,7 @@ class AppState:
     processors: tuple[Any, Any, Any] | None = None
     policy_bundle: Any = None
     camera: Any = None
+    wrist_cam: Any = None
     teleop_thread: threading.Thread | None = None
     infer_thread: threading.Thread | None = None
     stop_event: threading.Event = field(default_factory=threading.Event)
@@ -251,6 +256,37 @@ def _mjpeg_generator() -> Iterator[bytes]:
         yield (b"--frame\r\nContent-Type: image/jpeg\r\n\r\n" + jpg.tobytes() + b"\r\n")
 
 
+def _get_wrist_cam() -> Any:
+    if not ARM_CAM_INDEX:
+        raise RuntimeError("ARM_CAM_INDEX is not set in .env")
+    if state.wrist_cam is None:
+        with state.lock:
+            if state.wrist_cam is None:
+                cap = cv2.VideoCapture(int(ARM_CAM_INDEX))
+                cap.set(cv2.CAP_PROP_FRAME_WIDTH, ARM_CAM_WIDTH)
+                cap.set(cv2.CAP_PROP_FRAME_HEIGHT, ARM_CAM_HEIGHT)
+                if not cap.isOpened():
+                    cap.release()
+                    raise RuntimeError(
+                        f"failed to open wrist camera index {ARM_CAM_INDEX}"
+                    )
+                state.wrist_cam = cap
+    return state.wrist_cam
+
+
+def _wrist_mjpeg_generator() -> Iterator[bytes]:
+    cap = _get_wrist_cam()
+    while True:
+        ok, frame = cap.read()  # already BGR
+        if not ok:
+            time.sleep(0.05)
+            continue
+        ok2, jpg = cv2.imencode(".jpg", frame)
+        if not ok2:
+            continue
+        yield (b"--frame\r\nContent-Type: image/jpeg\r\n\r\n" + jpg.tobytes() + b"\r\n")
+
+
 # --- Routes -----------------------------------------------------------------
 @app.get("/", response_class=HTMLResponse)
 def index() -> str:
@@ -356,6 +392,18 @@ def camera() -> StreamingResponse:
     )
 
 
+@app.get("/wrist.mjpeg")
+def wrist_camera() -> StreamingResponse:
+    try:
+        _get_wrist_cam()
+    except Exception as e:  # noqa: BLE001
+        raise HTTPException(status_code=503, detail=f"wrist camera: {e}") from e
+    return StreamingResponse(
+        _wrist_mjpeg_generator(),
+        media_type="multipart/x-mixed-replace; boundary=frame",
+    )
+
+
 INDEX_HTML: Final[str] = """<!doctype html>
 <html><head><meta charset="utf-8"><title>SO-101 Dashboard</title>
 <style>
@@ -365,7 +413,7 @@ INDEX_HTML: Final[str] = """<!doctype html>
   background:#2d6cdf;color:#fff;cursor:pointer} button.stop{background:#c0392b}
   input{font-size:14px;padding:7px;margin:4px 0;width:340px;border-radius:6px;
   border:1px solid #333;background:#171a21;color:#e6e6e6}
-  #cam{max-width:640px;border-radius:8px;background:#000}
+  #cam,#wrist{max-width:480px;border-radius:8px;background:#000}
   pre{background:#171a21;padding:12px;border-radius:8px;max-width:640px;overflow:auto}
   .row{display:flex;gap:24px;flex-wrap:wrap;align-items:flex-start}
   .card{background:#141821;padding:14px 16px;border-radius:10px;margin-bottom:14px}
@@ -388,6 +436,8 @@ INDEX_HTML: Final[str] = """<!doctype html>
 <div class="row">
   <div><h3>Camera (phone)</h3><img id="cam" src="/camera.mjpeg"
        onerror="this.alt='camera unavailable'"></div>
+  <div><h3>Wrist cam (arm)</h3><img id="wrist" src="/wrist.mjpeg"
+       onerror="this.alt='wrist camera unavailable'"></div>
   <div><h3>Status</h3><pre id="status">loading…</pre></div>
 </div>
 <script>
