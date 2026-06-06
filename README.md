@@ -104,12 +104,22 @@ Setup:
    FOLLOWER_PORT=/dev/tty.usbmodemXXXX
    LEADER_PORT=/dev/tty.usbmodemYYYY
    ```
-2. Calibrate each arm once (first time only):
+2. Set motor IDs — **only if the motors are fresh from the kit** (assigns IDs
+   1–6; connect one motor at a time when prompted). Skip for pre-assembled arms:
+   ```bash
+   uv run lerobot-setup-motors --robot.type=so101_follower --robot.port=$FOLLOWER_PORT
+   uv run lerobot-setup-motors --teleop.type=so101_leader  --teleop.port=$LEADER_PORT
+   ```
+3. Calibrate each arm once (interactive — needs a real terminal). Move the arm to
+   the middle/rest pose, press Enter, then sweep every joint through its full range:
    ```bash
    uv run lerobot-calibrate --robot.type=so101_follower --robot.port=$FOLLOWER_PORT --robot.id=so101_follower
    uv run lerobot-calibrate --teleop.type=so101_leader  --teleop.port=$LEADER_PORT  --teleop.id=so101_leader
    ```
-3. Run the dashboard and open it:
+   The `--id` **must match** `ROBOT_ID` / `LEADER_ID` in `.env` — calibrations are
+   saved to `~/.cache/huggingface/lerobot/calibration/<type>/<id>.json` and loaded
+   by id at connect time. Persistent; redo only if you swap motors or change `--id`.
+4. Run the dashboard and open it:
    ```bash
    uv run python arm_dashboard.py    # http://localhost:8041
    ```
