@@ -1,29 +1,29 @@
-"""Minimal web dashboard to control an SO-101 leader/follower arm pair.
+"""Operator dashboard for the SO-101 arm + remote VLA inference.
 
 Run:
-    uv run python arm_dashboard.py
-    # then open http://localhost:8041
+    uv run python arm_dashboard.py        # http://localhost:8041
 
-What it does:
-- Connect / disconnect the SO-101 follower (robot) + SO-101 leader (teleoperator).
-- Start / stop teleoperation (leader drives follower) in a background thread,
-  using LeRobot's canonical loop (get_observation -> get_action -> processors ->
-  send_action) from ``lerobot_teleoperate``.
-- Start / stop VLA policy inference: load a Hugging Face policy (pi0, SmolVLA, …),
-  prompt it with a task string, and let it drive the follower (see policy_inference).
-- Live phone-camera preview (the IP Webcam stream from phone_camera.py) as MJPEG.
-- Status polling: connection state, loop FPS, latest joint commands.
+Capabilities:
+- Connect/disconnect the SO-101 follower + leader; start/stop teleoperation
+  (leader drives follower) in a background thread.
+- Run VLA inference **remotely** on the GPU box: clicking Run inference frees the
+  arm + wrist camera and launches ``run_robot_client.py`` as a managed subprocess
+  (device cuda, model ``lerobot/smolvla_base``, editable task). Stop kills it.
+- Live phone + USB-wrist camera previews with per-camera FPS.
+- Clean, state-aware UI: status pills, joint table, buttons that enable/disable by
+  state, plus GPU-box (SSH-tailed) and client log panels.
 
-Teleop and inference are mutually exclusive (both drive the follower).
-Configuration comes from .env (ports via ``uv run lerobot-find-port``); the HF
-token for gated policies comes from gitignored .env.local. Both arms plug into
-this computer over USB.
+Config from .env (ports, calibration, server address); HF token from .env.local.
 """
 
 from __future__ import annotations
 
 import os
 import secrets
+import signal
+import socket
+import subprocess
+import sys
 import threading
 import time
 from collections.abc import Iterator
@@ -34,39 +34,47 @@ from typing import Any, Final
 import cv2
 import uvicorn
 from fastapi import Depends, FastAPI, HTTPException
-from fastapi.responses import HTMLResponse, JSONResponse, StreamingResponse
+from fastapi.responses import (
+    FileResponse,
+    HTMLResponse,
+    JSONResponse,
+    StreamingResponse,
+)
 from fastapi.security import HTTPBasic, HTTPBasicCredentials
+from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
 # Importing phone_camera also loads .env and .env.local (HF_TOKEN) on import.
 from phone_camera import open_phone_camera
 
 # --- Configuration (from .env / environment) --------------------------------
+_HERE: Final[Path] = Path(__file__).resolve().parent
 FOLLOWER_PORT: Final[str] = os.environ.get("FOLLOWER_PORT", "")
 LEADER_PORT: Final[str] = os.environ.get("LEADER_PORT", "")
 FOLLOWER_ID: Final[str] = os.environ.get("ROBOT_ID", "so101_follower")
 LEADER_ID: Final[str] = os.environ.get("LEADER_ID", "so101_leader")
 TELEOP_FPS: Final[int] = int(os.environ.get("TELEOP_FPS", "60"))
-INFERENCE_FPS: Final[int] = int(os.environ.get("INFERENCE_FPS", "30"))
 DASHBOARD_PORT: Final[int] = int(os.environ.get("DASHBOARD_PORT", "8041"))
 DASHBOARD_USER: Final[str] = os.environ.get("DASHBOARD_USER", "admin")
 DASHBOARD_PASS: Final[str] = os.environ.get("DASHBOARD_PASS", "")
-DEFAULT_POLICY_PATH: Final[str] = os.environ.get("POLICY_PATH", "lerobot/smolvla_base")
+POLICY_PATH: Final[str] = os.environ.get("POLICY_PATH", "lerobot/smolvla_base")
 DEFAULT_POLICY_TASK: Final[str] = os.environ.get("POLICY_TASK", "Pick up the cube")
-DEFAULT_POLICY_DEVICE: Final[str] = os.environ.get("POLICY_DEVICE", "")
-# Repo-committed calibration (calibration/<id>.json), used for both arms.
+SERVER_POLICY_DEVICE: Final[str] = os.environ.get("SERVER_POLICY_DEVICE", "cuda")
+POLICY_SERVER_ADDRESS: Final[str] = os.environ.get("POLICY_SERVER_ADDRESS", "")
+GPU_SSH_HOST: Final[str] = os.environ.get("GPU_SSH_HOST", "")
 CALIB_DIR: Final[Path] = Path(
-    os.environ.get("CALIBRATION_DIR") or Path(__file__).resolve().parent / "calibration"
+    os.environ.get("CALIBRATION_DIR") or _HERE / "calibration"
 )
-# USB wrist camera (OpenCV device index); blank disables the wrist preview.
 ARM_CAM_INDEX: Final[str] = os.environ.get("ARM_CAM_INDEX", "")
 ARM_CAM_WIDTH: Final[int] = int(os.environ.get("ARM_CAM_WIDTH", "640"))
 ARM_CAM_HEIGHT: Final[int] = int(os.environ.get("ARM_CAM_HEIGHT", "480"))
+CLIENT_LOG: Final[Path] = _HERE / "logs" / "client.out"
+SERVER_LOG_REMOTE: Final[str] = "~/minifactory-hackathon/policy_server.out"
+# Built Vite SPA (committed). Served when present; otherwise the inline HTML below.
+DIST: Final[Path] = _HERE / "frontend" / "dist"
 
 
 # --- Authentication ---------------------------------------------------------
-# HTTP Basic Auth on every route so only people with the login/password (from
-# .env) can open the dashboard or call the APIs over the network.
 _basic: Final[HTTPBasic] = HTTPBasic()
 
 
@@ -89,21 +97,24 @@ _auth_deps: Final[list[Any]] = [Depends(require_auth)] if AUTH_ENABLED else []
 @dataclass
 class AppState:
     # lerobot device objects are kept as Any so the dashboard imports without the
-    # (heavy) robot/policy modules and runs on a machine with no arms attached.
+    # (heavy) robot modules and runs on a machine with no arms attached.
     robot: Any = None
     teleop: Any = None
     processors: tuple[Any, Any, Any] | None = None
-    policy_bundle: Any = None
     camera: Any = None
     wrist_cam: Any = None
     teleop_thread: threading.Thread | None = None
-    infer_thread: threading.Thread | None = None
     stop_event: threading.Event = field(default_factory=threading.Event)
-    infer_stop: threading.Event = field(default_factory=threading.Event)
     lock: threading.Lock = field(default_factory=threading.Lock)
-    fps: float = 0.0
+    infer_proc: subprocess.Popen[bytes] | None = None
+    infer_task: str = DEFAULT_POLICY_TASK
+    inference_status: str = "idle"  # idle | running | error
+    control_fps: float = 0.0
     last_action: dict[str, float] = field(default_factory=dict)
-    inference_status: str = "idle"  # idle | loading | running | error
+    phone_fps: float = 0.0
+    phone_fps_at: float = 0.0
+    wrist_fps: float = 0.0
+    wrist_fps_at: float = 0.0
     error: str | None = None
 
     @property
@@ -121,7 +132,7 @@ class AppState:
 
     @property
     def inference_running(self) -> bool:
-        return self.infer_thread is not None and self.infer_thread.is_alive()
+        return self.infer_proc is not None and self.infer_proc.poll() is None
 
 
 state: Final[AppState] = AppState()
@@ -131,9 +142,7 @@ if not AUTH_ENABLED:
 
 
 class InferenceRequest(BaseModel):
-    policy_path: str = DEFAULT_POLICY_PATH
     task: str = DEFAULT_POLICY_TASK
-    device: str = DEFAULT_POLICY_DEVICE
 
 
 # --- Arm control ------------------------------------------------------------
@@ -166,13 +175,24 @@ def _connect_arms() -> None:
     state.error = None
 
 
-def _disconnect_arms() -> None:
-    _stop_thread(state.infer_stop, state.infer_thread)
-    state.infer_thread = None
-    state.inference_status = "idle"
-    state.policy_bundle = None
-    _stop_thread(state.stop_event, state.teleop_thread)
+def _stop_teleop_thread() -> None:
+    state.stop_event.set()
+    if state.teleop_thread is not None and state.teleop_thread.is_alive():
+        state.teleop_thread.join(timeout=3.0)
     state.teleop_thread = None
+
+
+def _release_wrist_cam() -> None:
+    if state.wrist_cam is not None:
+        try:
+            state.wrist_cam.release()
+        except Exception:  # noqa: BLE001 - best-effort
+            pass
+        state.wrist_cam = None
+
+
+def _disconnect_arms() -> None:
+    _stop_teleop_thread()
     for dev in (state.teleop, state.robot):
         try:
             if dev is not None and dev.is_connected:
@@ -180,12 +200,6 @@ def _disconnect_arms() -> None:
         except Exception as e:  # noqa: BLE001 - best-effort cleanup
             state.error = f"disconnect: {e}"
     state.robot = state.teleop = state.processors = None
-
-
-def _stop_thread(event: threading.Event, thread: threading.Thread | None) -> None:
-    event.set()
-    if thread is not None and thread.is_alive():
-        thread.join(timeout=3.0)
 
 
 def _teleop_worker() -> None:
@@ -205,55 +219,138 @@ def _teleop_worker() -> None:
             break
         dt = time.perf_counter() - loop_start
         time.sleep(max(1.0 / TELEOP_FPS - dt, 0.0))
-        state.fps = round(1.0 / max(time.perf_counter() - loop_start, 1e-6), 1)
+        state.control_fps = round(1.0 / max(time.perf_counter() - loop_start, 1e-6), 1)
+    state.control_fps = 0.0
 
 
-def _inference_worker(policy_path: str, task: str, device: str) -> None:
-    # Imported lazily: pulls in torch + the policy stack, which is heavy.
-    from policy_inference import infer_action, load_policy
+# --- Remote inference (managed subprocess) ----------------------------------
+def _start_inference(task: str) -> None:
+    # Free the hardware so run_robot_client.py can own the arm + wrist camera.
+    _disconnect_arms()
+    _release_wrist_cam()
+    CLIENT_LOG.parent.mkdir(parents=True, exist_ok=True)
+    state.infer_task = task
+    state.error = None
+    logf = CLIENT_LOG.open("wb")
+    state.infer_proc = subprocess.Popen(
+        [sys.executable, str(_HERE / "run_robot_client.py")],
+        cwd=str(_HERE),
+        stdout=logf,
+        stderr=subprocess.STDOUT,
+        start_new_session=True,
+        env={**os.environ, "POLICY_TASK": task},
+    )
+    state.inference_status = "running"
 
+
+def _stop_inference() -> None:
+    proc = state.infer_proc
+    if proc is not None and proc.poll() is None:
+        try:
+            os.killpg(os.getpgid(proc.pid), signal.SIGTERM)
+            proc.wait(timeout=5)
+        except Exception:  # noqa: BLE001
+            try:
+                os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
+            except Exception:  # noqa: BLE001
+                pass
+    state.infer_proc = None
+    state.inference_status = "idle"
+
+
+def _refresh_inference_state() -> None:
+    """Detect a finished/crashed inference subprocess and update status."""
+    proc = state.infer_proc
+    if proc is not None and proc.poll() is not None:
+        if state.inference_status == "running":
+            clean = proc.returncode in (0, -signal.SIGTERM)
+            state.inference_status = "idle" if clean else "error"
+            if not clean:
+                state.error = f"inference client exited (code {proc.returncode})"
+        state.infer_proc = None
+
+
+# --- Logs -------------------------------------------------------------------
+_srv_log_text: str = ""
+_srv_log_at: float = 0.0
+
+
+def _server_logs() -> str:
+    """SSH-tail the policy server log on the GPU box (cached ~3s)."""
+    global _srv_log_text, _srv_log_at
+    if not GPU_SSH_HOST:
+        return "(GPU_SSH_HOST not set in .env)"
+    now = time.perf_counter()
+    if _srv_log_text and now - _srv_log_at < 3.0:
+        return _srv_log_text
     try:
-        state.inference_status = "loading"
-        state.error = None
-        bundle = load_policy(policy_path, state.robot, device=device or None)
-        state.policy_bundle = bundle
-        state.inference_status = "running"
-        while not state.infer_stop.is_set():
-            loop_start = time.perf_counter()
-            to_send = infer_action(state.robot, bundle, task)
-            state.robot.send_action(to_send)
-            state.last_action = {k: round(float(v), 2) for k, v in to_send.items()}
-            dt = time.perf_counter() - loop_start
-            time.sleep(max(1.0 / INFERENCE_FPS - dt, 0.0))
-            state.fps = round(1.0 / max(time.perf_counter() - loop_start, 1e-6), 1)
-    except Exception as e:  # noqa: BLE001 - surface to the UI
-        state.error = f"inference: {e}"
-        state.inference_status = "error"
-    else:
-        state.inference_status = "idle"
+        out = subprocess.run(
+            [
+                "ssh",
+                "-o",
+                "BatchMode=yes",
+                "-o",
+                "ConnectTimeout=5",
+                GPU_SSH_HOST,
+                f"tail -n 80 {SERVER_LOG_REMOTE}",
+            ],
+            capture_output=True,
+            text=True,
+            timeout=8,
+        )
+        _srv_log_text = out.stdout.strip() or out.stderr.strip() or "(no output)"
+    except Exception as e:  # noqa: BLE001
+        _srv_log_text = f"(server log unavailable: {e})"
+    _srv_log_at = now
+    return _srv_log_text
 
 
-# --- Camera preview ---------------------------------------------------------
+def _client_logs() -> str:
+    if not CLIENT_LOG.is_file():
+        return "(no client log yet)"
+    return CLIENT_LOG.read_bytes()[-8000:].decode("utf-8", "replace")
+
+
+_reach: bool = False
+_reach_at: float = 0.0
+
+
+def _server_reachable() -> bool:
+    """Cheap cached probe of the policy server's gRPC port."""
+    global _reach, _reach_at
+    now = time.perf_counter()
+    if now - _reach_at < 5.0:
+        return _reach
+    _reach_at = now
+    host, _, port = POLICY_SERVER_ADDRESS.rpartition(":")
+    if not host or not port.isdigit():
+        _reach = False
+        return _reach
+    try:
+        with socket.create_connection((host, int(port)), timeout=1.5):
+            _reach = True
+    except Exception:  # noqa: BLE001
+        _reach = False
+    return _reach
+
+
+# --- Camera previews --------------------------------------------------------
+def _tick_fps(times: list[float]) -> float:
+    """Append now to a rolling 1s window; return frames in the last second (~FPS)."""
+    now = time.perf_counter()
+    times.append(now)
+    cutoff = now - 1.0
+    while times and times[0] < cutoff:
+        times.pop(0)
+    return float(len(times))
+
+
 def _get_camera() -> Any:
     if state.camera is None:
         with state.lock:
             if state.camera is None:
                 state.camera = open_phone_camera()
     return state.camera
-
-
-def _mjpeg_generator() -> Iterator[bytes]:
-    cam = _get_camera()
-    while True:
-        try:
-            frame_rgb = cam.async_read(timeout_ms=2000)
-        except Exception:  # noqa: BLE001 - skip a dropped frame, keep streaming
-            time.sleep(0.05)
-            continue
-        ok, jpg = cv2.imencode(".jpg", cv2.cvtColor(frame_rgb, cv2.COLOR_RGB2BGR))
-        if not ok:
-            continue
-        yield (b"--frame\r\nContent-Type: image/jpeg\r\n\r\n" + jpg.tobytes() + b"\r\n")
 
 
 def _get_wrist_cam() -> Any:
@@ -274,8 +371,25 @@ def _get_wrist_cam() -> Any:
     return state.wrist_cam
 
 
+def _mjpeg_generator() -> Iterator[bytes]:
+    cam = _get_camera()
+    times: list[float] = []
+    while True:
+        try:
+            frame_rgb = cam.async_read(timeout_ms=2000)
+        except Exception:  # noqa: BLE001 - skip a dropped frame, keep streaming
+            time.sleep(0.05)
+            continue
+        ok, jpg = cv2.imencode(".jpg", cv2.cvtColor(frame_rgb, cv2.COLOR_RGB2BGR))
+        if not ok:
+            continue
+        state.phone_fps, state.phone_fps_at = _tick_fps(times), time.perf_counter()
+        yield (b"--frame\r\nContent-Type: image/jpeg\r\n\r\n" + jpg.tobytes() + b"\r\n")
+
+
 def _wrist_mjpeg_generator() -> Iterator[bytes]:
     cap = _get_wrist_cam()
+    times: list[float] = []
     while True:
         ok, frame = cap.read()  # already BGR
         if not ok:
@@ -284,34 +398,61 @@ def _wrist_mjpeg_generator() -> Iterator[bytes]:
         ok2, jpg = cv2.imencode(".jpg", frame)
         if not ok2:
             continue
+        state.wrist_fps, state.wrist_fps_at = _tick_fps(times), time.perf_counter()
         yield (b"--frame\r\nContent-Type: image/jpeg\r\n\r\n" + jpg.tobytes() + b"\r\n")
 
 
 # --- Routes -----------------------------------------------------------------
 @app.get("/", response_class=HTMLResponse)
-def index() -> str:
-    return INDEX_HTML
+def index() -> Any:
+    # Serve the built Vite SPA when present (auth-gated here so the browser caches
+    # Basic-Auth creds for the same-origin asset/API requests); else inline HTML.
+    spa = DIST / "index.html"
+    if spa.is_file():
+        return FileResponse(spa)
+    return HTMLResponse(INDEX_HTML)
 
 
 @app.get("/status")
 def status() -> JSONResponse:
+    _refresh_inference_state()
+    now = time.perf_counter()
+    phone = state.phone_fps if now - state.phone_fps_at < 2.0 else 0.0
+    wrist = state.wrist_fps if now - state.wrist_fps_at < 2.0 else 0.0
     return JSONResponse(
         {
             "connected": state.connected,
             "teleop_running": state.teleop_running,
             "inference_running": state.inference_running,
             "inference_status": state.inference_status,
-            "fps": state.fps,
-            "last_action": state.last_action,
+            "control_fps": state.control_fps,
+            "camera_fps": {"phone": round(phone, 1), "wrist": round(wrist, 1)},
+            "joints": state.last_action,
             "error": state.error,
+            "device": SERVER_POLICY_DEVICE,
+            "policy": POLICY_PATH,
+            "task": state.infer_task,
+            "server_reachable": _server_reachable(),
             "follower_port": FOLLOWER_PORT or None,
             "leader_port": LEADER_PORT or None,
         }
     )
 
 
+@app.get("/logs/server")
+def logs_server() -> dict[str, str]:
+    return {"text": _server_logs()}
+
+
+@app.get("/logs/client")
+def logs_client() -> dict[str, str]:
+    return {"text": _client_logs()}
+
+
 @app.post("/connect")
 def connect() -> dict[str, str]:
+    if state.inference_running:
+        raise HTTPException(status_code=409, detail="Stop inference first.")
     with state.lock:
         if state.connected:
             return {"status": "already connected"}
@@ -346,38 +487,27 @@ def teleop_start() -> dict[str, str]:
 
 @app.post("/teleop/stop")
 def teleop_stop() -> dict[str, str]:
-    _stop_thread(state.stop_event, state.teleop_thread)
-    state.teleop_thread = None
+    _stop_teleop_thread()
     return {"status": "teleop stopped"}
 
 
 @app.post("/inference/start")
 def inference_start(req: InferenceRequest) -> dict[str, str]:
-    if not state.connected:
-        raise HTTPException(status_code=400, detail="Connect the arms first.")
-    if state.teleop_running:
-        raise HTTPException(status_code=409, detail="Stop teleop first.")
     if state.inference_running:
         return {"status": "already running"}
-    state.infer_stop.clear()
-    state.infer_thread = threading.Thread(
-        target=_inference_worker,
-        args=(req.policy_path, req.task, req.device),
-        daemon=True,
-    )
-    state.infer_thread.start()
-    return {"status": "inference starting", "policy": req.policy_path, "task": req.task}
+    if not POLICY_SERVER_ADDRESS:
+        raise HTTPException(
+            status_code=400, detail="POLICY_SERVER_ADDRESS not set in .env."
+        )
+    with state.lock:
+        _start_inference(req.task)
+    return {"status": "inference starting", "task": req.task}
 
 
 @app.post("/inference/stop")
 def inference_stop() -> dict[str, str]:
-    _stop_thread(state.infer_stop, state.infer_thread)
-    state.infer_thread = None
-    state.inference_status = "idle"
+    _stop_inference()
     return {"status": "inference stopped"}
-
-
-# TODO(next): POST /record/start|stop -> wrap lerobot record (LeRobotDataset).
 
 
 @app.get("/camera.mjpeg")
@@ -387,8 +517,7 @@ def camera() -> StreamingResponse:
     except Exception as e:  # noqa: BLE001
         raise HTTPException(status_code=503, detail=f"camera: {e}") from e
     return StreamingResponse(
-        _mjpeg_generator(),
-        media_type="multipart/x-mixed-replace; boundary=frame",
+        _mjpeg_generator(), media_type="multipart/x-mixed-replace; boundary=frame"
     )
 
 
@@ -399,68 +528,135 @@ def wrist_camera() -> StreamingResponse:
     except Exception as e:  # noqa: BLE001
         raise HTTPException(status_code=503, detail=f"wrist camera: {e}") from e
     return StreamingResponse(
-        _wrist_mjpeg_generator(),
-        media_type="multipart/x-mixed-replace; boundary=frame",
+        _wrist_mjpeg_generator(), media_type="multipart/x-mixed-replace; boundary=frame"
     )
 
 
 INDEX_HTML: Final[str] = """<!doctype html>
 <html><head><meta charset="utf-8"><title>SO-101 Dashboard</title>
 <style>
-  body{font-family:system-ui,sans-serif;margin:24px;background:#0f1115;color:#e6e6e6}
-  h1{font-size:20px} h3{margin-bottom:6px}
-  button{font-size:15px;padding:8px 14px;margin:4px;border:0;border-radius:6px;
-  background:#2d6cdf;color:#fff;cursor:pointer} button.stop{background:#c0392b}
-  input{font-size:14px;padding:7px;margin:4px 0;width:340px;border-radius:6px;
-  border:1px solid #333;background:#171a21;color:#e6e6e6}
-  #cam,#wrist{max-width:480px;border-radius:8px;background:#000}
-  pre{background:#171a21;padding:12px;border-radius:8px;max-width:640px;overflow:auto}
-  .row{display:flex;gap:24px;flex-wrap:wrap;align-items:flex-start}
+  :root{color-scheme:dark}
+  body{font-family:system-ui,sans-serif;margin:20px;background:#0f1115;color:#e6e6e6}
+  h1{font-size:20px;margin:0 0 12px} h3{margin:0 0 8px;font-size:14px;color:#9aa4b2}
   .card{background:#141821;padding:14px 16px;border-radius:10px;margin-bottom:14px}
+  .row{display:flex;gap:16px;flex-wrap:wrap;align-items:flex-start}
+  button{font-size:14px;padding:8px 14px;margin:4px;border:0;border-radius:6px;
+    background:#2d6cdf;color:#fff;cursor:pointer}
+  button.stop{background:#c0392b} button:disabled{opacity:.35;cursor:not-allowed}
+  input{font-size:14px;padding:7px;border-radius:6px;border:1px solid #333;
+    background:#0f1115;color:#e6e6e6;width:320px}
+  .pill{display:inline-block;padding:3px 10px;border-radius:999px;font-size:13px;
+    margin:3px 6px 3px 0;background:#2a2f3a}
+  .on{background:#1e7e34}.off{background:#444}.warn{background:#b8860b}.err{background:#c0392b}
+  table{border-collapse:collapse;font-size:13px}
+  td{padding:2px 12px 2px 0} td.v{font-variant-numeric:tabular-nums;text-align:right}
+  img{max-width:420px;border-radius:8px;background:#000;display:block}
+  pre{background:#0b0d12;padding:10px;border-radius:8px;max-height:240px;overflow:auto;
+    font-size:12px;white-space:pre-wrap;margin:0}
+  .mono{font-variant-numeric:tabular-nums}
+  .banner{background:#c0392b;padding:8px 12px;border-radius:8px;margin-bottom:12px;display:none}
+  label{font-size:13px;color:#9aa4b2}
 </style></head><body>
 <h1>SO-101 Arm Dashboard</h1>
+<div id="banner" class="banner"></div>
+
 <div class="card">
-  <button onclick="post('/connect')">Connect arms</button>
-  <button class="stop" onclick="post('/disconnect')">Disconnect</button>
-  <button onclick="post('/teleop/start')">Start teleop</button>
-  <button class="stop" onclick="post('/teleop/stop')">Stop teleop</button>
+  <h3>STATUS</h3>
+  <div id="pills"></div>
+  <div class="row" style="margin-top:8px">
+    <table><tbody id="joints"></tbody></table>
+  </div>
 </div>
+
 <div class="card">
-  <h3>VLA policy inference</h3>
-  <div>HF policy repo:<br><input id="policy" value="lerobot/smolvla_base"></div>
-  <div>Task prompt:<br><input id="task" value="Pick up the cube"></div>
-  <div>Device (blank = auto):<br><input id="device" placeholder="mps / cuda / cpu"></div>
-  <button onclick="startInfer()">Run inference</button>
-  <button class="stop" onclick="post('/inference/stop')">Stop inference</button>
+  <h3>CONTROL</h3>
+  <button id="b_connect" onclick="post('/connect')">Connect arms</button>
+  <button id="b_disconnect" class="stop" onclick="post('/disconnect')">Disconnect</button>
+  <button id="b_teleop_start" onclick="post('/teleop/start')">Start teleop</button>
+  <button id="b_teleop_stop" class="stop" onclick="post('/teleop/stop')">Stop teleop</button>
 </div>
+
+<div class="card">
+  <h3>INFERENCE (remote &middot; GPU box)</h3>
+  <div><label>model</label> <span class="pill mono" id="model">…</span>
+       <label>device</label> <span class="pill mono" id="device">…</span></div>
+  <div style="margin:8px 0"><label>task</label><br><input id="task" value="Pick up the cube"></div>
+  <button id="b_infer_start" onclick="startInfer()">Run inference</button>
+  <button id="b_infer_stop" class="stop" onclick="post('/inference/stop')">Stop inference</button>
+</div>
+
 <div class="row">
-  <div><h3>Camera (phone)</h3><img id="cam" src="/camera.mjpeg"
-       onerror="this.alt='camera unavailable'"></div>
-  <div><h3>Wrist cam (arm)</h3><img id="wrist" src="/wrist.mjpeg"
-       onerror="this.alt='wrist camera unavailable'"></div>
-  <div><h3>Status</h3><pre id="status">loading…</pre></div>
+  <div class="card"><h3>PHONE CAM <span id="phone_fps" class="mono"></span></h3>
+    <img src="/camera.mjpeg" onerror="this.alt='phone camera unavailable'"></div>
+  <div class="card"><h3>WRIST CAM <span id="wrist_fps" class="mono"></span></h3>
+    <img src="/wrist.mjpeg" onerror="this.alt='wrist cam unavailable (used by client during inference)'"></div>
 </div>
+
+<div class="row">
+  <div class="card" style="flex:1;min-width:380px"><h3>GPU-BOX SERVER LOG</h3>
+    <pre id="srvlog">…</pre></div>
+  <div class="card" style="flex:1;min-width:380px"><h3>CLIENT LOG</h3>
+    <pre id="clilog">…</pre></div>
+</div>
+
 <script>
+function pill(label, cls){return `<span class="pill ${cls}">${label}</span>`}
 async function post(p){
   try{const r=await fetch(p,{method:'POST'});
     if(!r.ok){alert((await r.json()).detail||r.statusText);}}
   catch(e){alert(e);} refresh();
 }
 async function startInfer(){
-  const body={policy_path:policy.value,task:task.value,device:device.value};
-  try{const r=await fetch('/inference/start',
-    {method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});
+  if(!confirm('Run inference will release the arm to the remote client and move it. Continue?'))return;
+  try{const r=await fetch('/inference/start',{method:'POST',
+    headers:{'Content-Type':'application/json'},
+    body:JSON.stringify({task:document.getElementById('task').value})});
     if(!r.ok){alert((await r.json()).detail||r.statusText);}}
   catch(e){alert(e);} refresh();
 }
+function setDisabled(id,v){document.getElementById(id).disabled=v}
 async function refresh(){
-  try{const r=await fetch('/status');
-    document.getElementById('status').textContent=JSON.stringify(await r.json(),null,2);}
-  catch(e){}
+  let s; try{s=await (await fetch('/status')).json();}catch(e){return}
+  const inf=s.inference_running, con=s.connected, tel=s.teleop_running;
+  document.getElementById('pills').innerHTML =
+    pill(con?'arms: connected':'arms: disconnected', con?'on':'off') +
+    pill(tel?`teleop: on (${s.control_fps} Hz)`:'teleop: off', tel?'on':'off') +
+    pill(`inference: ${s.inference_status}`,
+         s.inference_status==='running'?'on':s.inference_status==='error'?'err':'off') +
+    pill(s.server_reachable?'server: reachable':'server: down', s.server_reachable?'on':'err');
+  // joints
+  const j=s.joints||{}; let rows='';
+  for(const k of Object.keys(j)) rows+=`<tr><td>${k}</td><td class="v">${j[k]}</td></tr>`;
+  document.getElementById('joints').innerHTML = rows || '<tr><td>(no joint data)</td></tr>';
+  // error banner
+  const b=document.getElementById('banner');
+  if(s.error){b.style.display='block';b.textContent='⚠ '+s.error}else{b.style.display='none'}
+  // inference info
+  document.getElementById('model').textContent=s.policy;
+  document.getElementById('device').textContent=s.device;
+  // camera fps
+  document.getElementById('phone_fps').textContent = s.camera_fps.phone? `${s.camera_fps.phone} fps`:'';
+  document.getElementById('wrist_fps').textContent = s.camera_fps.wrist? `${s.camera_fps.wrist} fps`:'';
+  // buttons
+  setDisabled('b_connect', con||inf);
+  setDisabled('b_disconnect', !con||inf);
+  setDisabled('b_teleop_start', !con||tel||inf);
+  setDisabled('b_teleop_stop', !tel);
+  setDisabled('b_infer_start', inf);
+  setDisabled('b_infer_stop', !inf);
 }
-setInterval(refresh,1000); refresh();
+async function refreshLogs(){
+  try{document.getElementById('srvlog').textContent=(await (await fetch('/logs/server')).json()).text;}catch(e){}
+  try{document.getElementById('clilog').textContent=(await (await fetch('/logs/client')).json()).text;}catch(e){}
+}
+setInterval(refresh,1000); setInterval(refreshLogs,4000); refresh(); refreshLogs();
 </script></body></html>
 """
+
+
+# Serve the SPA's hashed JS/CSS bundles (non-sensitive) when the build exists.
+if (DIST / "assets").is_dir():
+    app.mount("/assets", StaticFiles(directory=DIST / "assets"), name="assets")
 
 
 if __name__ == "__main__":

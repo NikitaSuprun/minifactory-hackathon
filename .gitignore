@@ -21,3 +21,10 @@ stream_sample.png
 
 # LeRobot run logs
 logs/
+
+# Frontend deps (frontend/dist IS committed so the SPA serves without Node)
+frontend/node_modules/
+frontend/.vite/
+frontend/tsconfig.tsbuildinfo
+# Re-include the built SPA bundle (the generic `dist/` rule above would hide it)
+!frontend/dist/

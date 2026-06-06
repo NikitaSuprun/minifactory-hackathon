@@ -133,6 +133,21 @@ Setup:
    ```
    The port is set by `DASHBOARD_PORT` in `.env` (default 8041).
 
+The dashboard is a **Vite + React + Tailwind** SPA (`frontend/`). The built bundle in
+`frontend/dist/` is committed and served by FastAPI, so the command above works with no
+Node step. It shows status pills, state-aware controls, the inference panel, phone +
+wrist camera tiles with live FPS, and the GPU-box + client log panels. To work on the
+UI:
+
+```bash
+cd frontend
+npm install
+npm run dev      # http://localhost:5173 (HMR, proxies the API to :8041)
+npm run build    # refresh frontend/dist (commit it)
+```
+
+If `frontend/dist` is absent, the dashboard falls back to a built-in inline HTML page.
+
 ### Login (protects the dashboard + APIs)
 
 The dashboard binds to `0.0.0.0`, so it's reachable on the WiFi. Every route

@@ -20,6 +20,7 @@ Caveats (read before expecting motion):
 
 from __future__ import annotations
 
+import os
 import tempfile
 from dataclasses import dataclass
 from pathlib import Path
@@ -111,8 +112,10 @@ def load_policy(
     )
 
     # A throwaway dataset supplies the metadata (feature shapes/stats) make_policy
-    # requires; no frames are ever written to it.
-    scratch_root: Path = Path(tempfile.mkdtemp(prefix="lerobot_infer_"))
+    # requires; no frames are ever written to it. LeRobotDataset.create makes the
+    # dir itself, so pass a unique path that does NOT exist yet (mkdtemp would
+    # pre-create it and create() then fails with "File exists").
+    scratch_root: Path = Path(tempfile.gettempdir()) / f"lerobot_infer_{os.getpid()}"
     scratch: LeRobotDataset = LeRobotDataset.create(
         repo_id="inference/scratch",
         fps=_SCRATCH_FPS,
