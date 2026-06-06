@@ -18,8 +18,9 @@ from __future__ import annotations
 
 import os
 import sys
+from collections.abc import Callable
 from pathlib import Path
-from typing import Final
+from typing import Final, cast
 
 from dotenv import load_dotenv
 
@@ -71,9 +72,10 @@ def main() -> None:
     print(
         f"launching policy server on {SERVER_HOST}:{SERVER_PORT} (obs atol={OBS_SIMILARITY_ATOL})"
     )
-    # serve() is draccus-wrapped: it parses cfg from argv at runtime, so the
-    # declared `cfg` parameter is supplied there, not by this call.
-    policy_server.serve()  # pyright: ignore[reportCallIssue]
+    # serve() is draccus-wrapped: draccus.wrap() makes it callable with no args (it
+    # parses cfg from argv), so cast away the stub's declared `cfg` parameter.
+    serve = cast(Callable[[], None], policy_server.serve)
+    serve()
 
 
 if __name__ == "__main__":

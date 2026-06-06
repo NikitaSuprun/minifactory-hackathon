@@ -20,20 +20,13 @@ from threading import Event, Lock, Thread
 from typing import Any
 
 import cv2
+import depthai as dai
 from numpy.typing import NDArray
 
 from lerobot.cameras.camera import Camera
 from lerobot.cameras.configs import CameraConfig, ColorMode
 
 from oak_camera import build_oak_rgb_pipeline
-
-try:  # depthai is optional on machines without an OAK attached
-    import depthai as dai
-
-    _DEFAULT_SOCKET = "CAM_A"
-except Exception:  # noqa: BLE001 - import guarded so the module still loads
-    dai = None  # type: ignore[assignment]
-    _DEFAULT_SOCKET = "CAM_A"
 
 
 @CameraConfig.register_subclass("oak")
@@ -48,7 +41,7 @@ class OakDepthAICameraConfig(CameraConfig):
 
     color_mode: ColorMode = ColorMode.RGB
     warmup_s: float = 1.0
-    socket: str = _DEFAULT_SOCKET
+    socket: str = "CAM_A"
 
 
 class OakDepthAICamera(Camera):
@@ -88,8 +81,6 @@ class OakDepthAICamera(Camera):
 
     @staticmethod
     def find_cameras() -> list[dict[str, Any]]:
-        if dai is None:
-            return []
         cams: list[dict[str, Any]] = []
         for d in dai.Device.getAllAvailableDevices():
             cams.append(
@@ -106,10 +97,6 @@ class OakDepthAICamera(Camera):
     def connect(self, warmup: bool = True) -> None:
         if self.is_connected:
             raise RuntimeError(f"{self} is already connected.")
-        if dai is None:
-            raise ConnectionError(
-                "depthai is not importable; cannot open the OAK camera."
-            )
         socket = getattr(dai.CameraBoardSocket, self.socket_name)
         width, height = int(self.width or 640), int(self.height or 480)
         self._pipeline, self._queue = build_oak_rgb_pipeline(

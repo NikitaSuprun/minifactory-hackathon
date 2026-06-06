@@ -17,11 +17,16 @@ camera's width/height/fps unset so LeRobot auto-detects the stream instead of tr
 
 from __future__ import annotations
 
+import atexit
 import os
+import signal
 import sys
 import threading
+import time
 from pathlib import Path
-from typing import Final
+from typing import Any, Final
+
+import camera_lock
 
 from lerobot.async_inference.configs import RobotClientConfig
 from lerobot.async_inference.robot_client import RobotClient
@@ -77,11 +82,31 @@ CAM3_FPS: Final[str] = os.environ.get("CAM3_FPS", "30")
 CAM3_SOURCE: Final[str] = os.environ.get("CAM3_SOURCE", "opencv").strip().lower()
 
 
+# Seconds to wait after claiming the camera lock so the dashboard can release the
+# devices (notably the OAK) before we open them.
+CAMERA_LOCK_GRACE_S: Final[float] = 2.0
+
+
+def _release_and_exit(signum: int, frame: Any) -> None:
+    # The dashboard stops inference with SIGTERM; drop the lock so it resumes promptly.
+    camera_lock.release()
+    sys.exit(0)
+
+
 def main() -> None:
     if not FOLLOWER_PORT:
         sys.exit("FOLLOWER_PORT is not set in .env (run `uv run lerobot-find-port`).")
     if not SERVER_ADDRESS:
         sys.exit("POLICY_SERVER_ADDRESS is not set in .env (e.g. 192.168.1.50:8080).")
+
+    # Claim the cameras for this run so the dashboard yields them (it watches this lock
+    # and shows a placeholder instead of reading the same devices). Released on every
+    # exit path; a hard kill is covered by the dashboard's stale-pid check. The grace
+    # delay lets the dashboard free the devices before we open them.
+    camera_lock.acquire()
+    atexit.register(camera_lock.release)
+    signal.signal(signal.SIGTERM, _release_and_exit)
+    time.sleep(CAMERA_LOCK_GRACE_S)
 
     # Cameras sent to the policy: the phone stream (URL, kept as a string so the URL
     # survives intact) and, if present, the USB wrist camera (device index). The dict keys

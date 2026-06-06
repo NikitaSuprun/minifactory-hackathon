@@ -32,6 +32,7 @@ from pathlib import Path
 from typing import Any, Final
 
 import cv2
+import numpy as np
 import uvicorn
 from fastapi import Depends, FastAPI, HTTPException
 from fastapi.responses import (
@@ -43,6 +44,8 @@ from fastapi.responses import (
 from fastapi.security import HTTPBasic, HTTPBasicCredentials
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
+
+import camera_lock
 
 # Importing phone_camera also loads .env and .env.local (HF_TOKEN) on import.
 from phone_camera import open_phone_camera
@@ -116,6 +119,7 @@ class AppState:
     # can't race a concurrent read in the preview generator and segfault OpenCV.
     wrist_cam_lock: threading.Lock = field(default_factory=threading.Lock)
     cam3_lock: threading.Lock = field(default_factory=threading.Lock)
+    phone_cam_lock: threading.Lock = field(default_factory=threading.Lock)
     infer_proc: subprocess.Popen[bytes] | None = None
     infer_task: str = DEFAULT_POLICY_TASK
     inference_status: str = "idle"  # idle | running | error
@@ -215,6 +219,29 @@ def _release_cam3() -> None:
             state.cam3 = None
 
 
+def _release_camera() -> None:
+    # Phone camera (lerobot OpenCVCamera); disconnect stops its background read thread.
+    with state.phone_cam_lock:
+        if state.camera is not None:
+            try:
+                state.camera.disconnect()
+            except Exception:  # noqa: BLE001 - best-effort
+                pass
+            state.camera = None
+
+
+def _release_all_cameras() -> None:
+    _release_camera()
+    _release_wrist_cam()
+    _release_cam3()
+
+
+def inference_active() -> bool:
+    """True when the model owns the cameras: our own inference subprocess is running,
+    or another process (e.g. an external ``run_robot_client.py``) holds the camera lock."""
+    return state.inference_running or camera_lock.active()
+
+
 def _disconnect_arms() -> None:
     _stop_teleop_thread()
     for dev in (state.teleop, state.robot):
@@ -249,10 +276,9 @@ def _teleop_worker() -> None:
 
 # --- Remote inference (managed subprocess) ----------------------------------
 def _start_inference(task: str) -> None:
-    # Free the hardware so run_robot_client.py can own the arm + wrist camera.
+    # Free the hardware so run_robot_client.py can own the arm + all cameras.
     _disconnect_arms()
-    _release_wrist_cam()
-    _release_cam3()
+    _release_all_cameras()
     CLIENT_LOG.parent.mkdir(parents=True, exist_ok=True)
     state.infer_task = task
     state.error = None
@@ -370,7 +396,45 @@ def _tick_fps(times: list[float]) -> float:
     return float(len(times))
 
 
+_PLACEHOLDER_CACHE: dict[str, bytes] = {}
+
+
+def _placeholder_jpeg(label: str) -> bytes:
+    """Cached gray JPEG shown in a tile while the model owns that camera."""
+    if label not in _PLACEHOLDER_CACHE:
+        img = np.full((480, 640, 3), 38, dtype=np.uint8)
+        cv2.putText(
+            img,
+            "inference running",
+            (120, 225),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            1.1,
+            (210, 210, 210),
+            2,
+            cv2.LINE_AA,
+        )
+        cv2.putText(
+            img,
+            f"{label}: camera in use by the model",
+            (70, 275),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.65,
+            (150, 150, 150),
+            1,
+            cv2.LINE_AA,
+        )
+        ok, jpg = cv2.imencode(".jpg", img)
+        _PLACEHOLDER_CACHE[label] = jpg.tobytes() if ok else b""
+    return _PLACEHOLDER_CACHE[label]
+
+
+def _mjpeg_chunk(jpg: bytes) -> bytes:
+    return b"--frame\r\nContent-Type: image/jpeg\r\n\r\n" + jpg + b"\r\n"
+
+
 def _get_camera() -> Any:
+    if inference_active():
+        raise RuntimeError("cameras are owned by the running inference")
     if state.camera is None:
         with state.lock:
             if state.camera is None:
@@ -379,6 +443,8 @@ def _get_camera() -> Any:
 
 
 def _get_wrist_cam() -> Any:
+    if inference_active():
+        raise RuntimeError("cameras are owned by the running inference")
     if not ARM_CAM_INDEX:
         raise RuntimeError("ARM_CAM_INDEX is not set in .env")
     if state.wrist_cam is None:
@@ -419,6 +485,8 @@ def _open_cam3() -> Any:
 
 
 def _get_cam3() -> Any:
+    if inference_active():
+        raise RuntimeError("cameras are owned by the running inference")
     if state.cam3 is None:
         with state.lock:
             if state.cam3 is None:
@@ -427,10 +495,16 @@ def _get_cam3() -> Any:
 
 
 def _mjpeg_generator() -> Iterator[bytes]:
-    cam = _get_camera()
     times: list[float] = []
     while True:
+        # While the model owns the cameras, don't open/read this device — show a
+        # placeholder. The stream stays open so it resumes live when inference ends.
+        if inference_active():
+            yield _mjpeg_chunk(_placeholder_jpeg("phone"))
+            time.sleep(0.3)
+            continue
         try:
+            cam = _get_camera()
             frame_rgb = cam.async_read(timeout_ms=2000)
         except Exception:  # noqa: BLE001 - skip a dropped frame, keep streaming
             time.sleep(0.05)
@@ -439,19 +513,27 @@ def _mjpeg_generator() -> Iterator[bytes]:
         if not ok:
             continue
         state.phone_fps, state.phone_fps_at = _tick_fps(times), time.perf_counter()
-        yield (b"--frame\r\nContent-Type: image/jpeg\r\n\r\n" + jpg.tobytes() + b"\r\n")
+        yield _mjpeg_chunk(jpg.tobytes())
 
 
 def _wrist_mjpeg_generator() -> Iterator[bytes]:
-    _get_wrist_cam()  # open it (if needed) before streaming
     times: list[float] = []
     while True:
-        # Read under the lock and re-fetch each iteration: if inference released the
-        # cam, state.wrist_cam is None and we stop instead of reading freed memory.
+        if inference_active():
+            yield _mjpeg_chunk(_placeholder_jpeg("wrist"))
+            time.sleep(0.3)
+            continue
+        # Read under the lock and re-fetch each iteration so a release (by inference or
+        # the watcher) can't race a concurrent read of freed memory.
+        try:
+            _get_wrist_cam()
+        except Exception:  # noqa: BLE001 - camera unavailable; keep the stream alive
+            time.sleep(0.3)
+            continue
         with state.wrist_cam_lock:
             cap = state.wrist_cam
-            if cap is None:
-                return
+            if cap is None:  # released between _get_wrist_cam and here; retry
+                continue
             ok, frame = cap.read()  # already BGR
         if not ok:
             time.sleep(0.05)
@@ -460,19 +542,27 @@ def _wrist_mjpeg_generator() -> Iterator[bytes]:
         if not ok2:
             continue
         state.wrist_fps, state.wrist_fps_at = _tick_fps(times), time.perf_counter()
-        yield (b"--frame\r\nContent-Type: image/jpeg\r\n\r\n" + jpg.tobytes() + b"\r\n")
+        yield _mjpeg_chunk(jpg.tobytes())
 
 
 def _cam3_mjpeg_generator() -> Iterator[bytes]:
-    _get_cam3()  # open it (if needed) before streaming
     times: list[float] = []
     while True:
-        # Read under the lock and re-fetch each iteration: if inference released the
-        # cam, state.cam3 is None and we stop instead of reading freed memory.
+        if inference_active():
+            yield _mjpeg_chunk(_placeholder_jpeg("camera3"))
+            time.sleep(0.3)
+            continue
+        # Read under the lock and re-fetch each iteration so a release (by inference or
+        # the watcher) can't race a concurrent read of freed memory.
+        try:
+            _get_cam3()
+        except Exception:  # noqa: BLE001 - camera unavailable; keep the stream alive
+            time.sleep(0.3)
+            continue
         with state.cam3_lock:
             cap = state.cam3
-            if cap is None:
-                return
+            if cap is None:  # released between _get_cam3 and here; retry
+                continue
             ok, frame = cap.read()  # already BGR
         if not ok:
             time.sleep(0.05)
@@ -481,7 +571,7 @@ def _cam3_mjpeg_generator() -> Iterator[bytes]:
         if not ok2:
             continue
         state.cam3_fps, state.cam3_fps_at = _tick_fps(times), time.perf_counter()
-        yield (b"--frame\r\nContent-Type: image/jpeg\r\n\r\n" + jpg.tobytes() + b"\r\n")
+        yield _mjpeg_chunk(jpg.tobytes())
 
 
 # --- Routes -----------------------------------------------------------------
@@ -519,6 +609,7 @@ def status() -> JSONResponse:
             "device": SERVER_POLICY_DEVICE,
             "policy": POLICY_PATH,
             "task": state.infer_task,
+            "cameras_locked": inference_active(),
             "server_reachable": _server_reachable(),
             "follower_port": FOLLOWER_PORT or None,
             "leader_port": LEADER_PORT or None,
@@ -597,12 +688,16 @@ def inference_stop() -> dict[str, str]:
     return {"status": "inference stopped"}
 
 
+# During inference the model owns the cameras: skip the pre-open probe so the stream
+# starts and shows the placeholder instead of a 503. When not locked, keep the probe so
+# a genuinely missing/broken camera still surfaces as 503.
 @app.get("/camera.mjpeg")
 def camera() -> StreamingResponse:
-    try:
-        _get_camera()
-    except Exception as e:  # noqa: BLE001
-        raise HTTPException(status_code=503, detail=f"camera: {e}") from e
+    if not inference_active():
+        try:
+            _get_camera()
+        except Exception as e:  # noqa: BLE001
+            raise HTTPException(status_code=503, detail=f"camera: {e}") from e
     return StreamingResponse(
         _mjpeg_generator(), media_type="multipart/x-mixed-replace; boundary=frame"
     )
@@ -610,10 +705,11 @@ def camera() -> StreamingResponse:
 
 @app.get("/wrist.mjpeg")
 def wrist_camera() -> StreamingResponse:
-    try:
-        _get_wrist_cam()
-    except Exception as e:  # noqa: BLE001
-        raise HTTPException(status_code=503, detail=f"wrist camera: {e}") from e
+    if not inference_active():
+        try:
+            _get_wrist_cam()
+        except Exception as e:  # noqa: BLE001
+            raise HTTPException(status_code=503, detail=f"wrist camera: {e}") from e
     return StreamingResponse(
         _wrist_mjpeg_generator(), media_type="multipart/x-mixed-replace; boundary=frame"
     )
@@ -621,10 +717,11 @@ def wrist_camera() -> StreamingResponse:
 
 @app.get("/camera3.mjpeg")
 def camera3_camera() -> StreamingResponse:
-    try:
-        _get_cam3()
-    except Exception as e:  # noqa: BLE001
-        raise HTTPException(status_code=503, detail=f"cam3: {e}") from e
+    if not inference_active():
+        try:
+            _get_cam3()
+        except Exception as e:  # noqa: BLE001
+            raise HTTPException(status_code=503, detail=f"cam3: {e}") from e
     return StreamingResponse(
         _cam3_mjpeg_generator(), media_type="multipart/x-mixed-replace; boundary=frame"
     )
@@ -760,5 +857,20 @@ if (DIST / "assets").is_dir():
     app.mount("/assets", StaticFiles(directory=DIST / "assets"), name="assets")
 
 
+def _camera_lock_watcher() -> None:
+    """Release all cameras the moment the model takes the lock, so it always wins —
+    even tiles no browser is viewing (whose cameras would otherwise stay cached-open)."""
+    was_active = False
+    while True:
+        active = inference_active()
+        if active and not was_active:
+            _release_all_cameras()
+        was_active = active
+        time.sleep(0.25)
+
+
 if __name__ == "__main__":
+    threading.Thread(
+        target=_camera_lock_watcher, name="camera_lock_watcher", daemon=True
+    ).start()
     uvicorn.run(app, host="0.0.0.0", port=DASHBOARD_PORT)

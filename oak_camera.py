@@ -62,8 +62,7 @@ class OakCamera:
         pkt = self._queue.tryGet()
         if pkt is None:
             return False, None
-        # tryGet() is typed as the generic ADatatype; at runtime it's an ImgFrame.
-        return True, pkt.getCvFrame()  # pyright: ignore[reportAttributeAccessIssue]  # already BGR
+        return True, pkt.getCvFrame()  # already BGR (ImgFrame at runtime)
 
     def release(self) -> None:
         if self._running:
