@@ -157,8 +157,15 @@ the GPU box is in the cloud / behind NAT, make that port reachable via a public
 IP, **Tailscale/VPN**, or an **SSH tunnel** (simpler than an nginx gRPC proxy):
 
 ```bash
-# from the Mac, tunnel local 8080 to the GPU box's 8080:
-ssh -N -L 8080:localhost:8080 user@gpu-box   # then POLICY_SERVER_ADDRESS=localhost:8080
+# helper: reads GPU_SSH_HOST / TUNNEL_LOCAL_PORT from .env and forwards the port
+uv run python run_tunnel.py
+# then set POLICY_SERVER_ADDRESS=localhost:8080
+```
+
+```dotenv
+GPU_SSH_HOST=ubuntu@gpu-box   # or user@<public-ip>
+GPU_SSH_PORT=22
+TUNNEL_LOCAL_PORT=8080
 ```
 
 Configure both sides in `.env`:
