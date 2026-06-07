@@ -10,15 +10,19 @@ until changed; no deadman watchdog):
 
 Telemetry: car_action (state). car_speed exists but is a constant — ignore it.
 
+Connection: tries WiFi first (default host "car.local"), then falls back to USB
+serial automatically. So a plain run works cabled or cable-free without changing
+anything. (Note: on the current car WiFi is a hardware fault — see docs/car.md — so
+in practice it briefly tries WiFi, fails, and lands on USB.)
+
 Run:
-    uv run python drive_dashboard.py                           # USB serial, http://localhost:8043
-    ATECH_CAR_PORT=/dev/cu.usbmodem11201 uv run python drive_dashboard.py
-    ATECH_CAR_HOST=192.168.4.1 uv run python drive_dashboard.py # WiFi (no cable!)
+    uv run python drive_dashboard.py                            # WiFi if reachable, else USB
+    ATECH_CAR_HOST="" uv run python drive_dashboard.py          # force USB only (skip WiFi)
+    ATECH_CAR_HOST=192.168.4.1 uv run python drive_dashboard.py # pin a specific WiFi host
+    ATECH_CAR_PORT=/dev/cu.usbmodem11201 uv run python drive_dashboard.py  # pin a serial port
 
 Over USB: only one program can own the serial port — close the atech browser Web
-Serial bridge (and any probe/monitor) first. Over WiFi: the car is its OWN hotspot
-(AP mode) — join its WiFi "atech-car" (pass "minifactory") from the Mac, then set
-ATECH_CAR_HOST=192.168.4.1 (firmware: firmware/build_car_speaker.py).
+Serial bridge (and any probe/monitor) first.
 """
 
 from __future__ import annotations
@@ -38,9 +42,14 @@ from carlink import Car, connect_serial, connect_wifi
 load_dotenv()
 
 CAR_PORT = os.environ.get("ATECH_CAR_PORT") or None  # None = auto-discover
-# Set ATECH_CAR_HOST (e.g. "car.local" or an IP) to drive over WiFi instead of
-# the USB cable — needs the WiFi firmware flashed (firmware/build_car_speaker.py).
-CAR_HOST = os.environ.get("ATECH_CAR_HOST") or None
+# WiFi is TRIED FIRST, then we fall back to USB serial. Default host is the car's
+# mDNS name; set ATECH_CAR_HOST="" to skip WiFi entirely (USB only), or to a
+# specific IP to pin it. (needs the WiFi firmware: firmware/build_car_speaker.py.)
+CAR_HOST = os.environ.get("ATECH_CAR_HOST", "car.local") or None
+# WiFi connect is only *attempted* before falling back to USB, so keep it short.
+# (Bounded with a thread in connect() — mDNS ".local" resolution alone can block
+# ~5s regardless of socket timeouts.)
+WIFI_TIMEOUT = float(os.environ.get("ATECH_WIFI_TIMEOUT", "1.5"))
 # 224 is the empirical ceiling — above it the motor surge browns out the board's
 # USB. Cap here so the slider/commands can't push past it.
 MAX_SPEED = int(os.environ.get("CAR_MAX_SPEED", "224"))
@@ -97,6 +106,7 @@ class CarLink:
         self.port = port
         self.car: Car | None = None
         self.error: str | None = None
+        self._via: str | None = None  # "wifi" | "serial" — which transport is live
         self.last_cmd: tuple[str, int] | None = None  # replayed after a reconnect
         self.reconnects = 0
         self._connected_at = 0.0
@@ -113,24 +123,49 @@ class CarLink:
         self._watchdog = threading.Thread(target=self._watch, daemon=True)
         self._watchdog.start()
 
+    @staticmethod
+    def _try_wifi_board() -> Any:
+        """Connect over WiFi, but give up after WIFI_TIMEOUT. Bounded with a daemon
+        thread because mDNS ".local" resolution can block ~5s regardless of the
+        socket timeout — an unresolvable host must not stall the reconnect loop."""
+        out: dict[str, Any] = {}
+
+        def _go() -> None:
+            try:
+                out["board"] = connect_wifi(CAR_HOST, connect_timeout=WIFI_TIMEOUT)
+            except Exception:  # noqa: BLE001
+                pass  # unresolvable / unreachable -> leave out empty
+
+        t = threading.Thread(target=_go, daemon=True)
+        t.start()
+        t.join(WIFI_TIMEOUT)
+        return out.get("board")  # None if it timed out or failed
+
     def connect(self) -> bool:
         with self._lock:
             self._close_locked()
+            # Try WiFi first (cable-free), then fall back to USB serial.
+            if CAR_HOST:
+                board = self._try_wifi_board()
+                if board is not None:
+                    self.car = Car(board, name="car")
+                    self._via = "wifi"
+                    self.error = None
+                    self._connected_at = time.time()
+                    return True
             try:
-                board = (
-                    connect_wifi(CAR_HOST) if CAR_HOST else connect_serial(self.port)
-                )
-                self.car = Car(board, name="car")
+                self.car = Car(connect_serial(self.port), name="car")
+                self._via = "serial"
                 self.error = None
                 self._connected_at = time.time()
                 return True
             except Exception as e:  # noqa: BLE001
                 self.car = None
                 msg = str(e)
-                if CAR_HOST:
-                    msg += f" — can't reach the car at {CAR_HOST}:3333 (powered on & on WiFi?)"
-                elif any(s in msg.lower() for s in ("busy", "resource", "access")):
+                if any(s in msg.lower() for s in ("busy", "resource", "access")):
                     msg += " — close the atech web bridge / serial monitor first."
+                elif CAR_HOST:
+                    msg += f" (also couldn't reach the car over WiFi at {CAR_HOST})"
                 self.error = msg
                 return False
 
@@ -292,7 +327,11 @@ class CarLink:
         alive = car is not None and not self._is_dead(send_err)
         return {
             "connected": alive,
-            "port": (f"wifi {CAR_HOST}") if CAR_HOST else (self.port or "(auto)"),
+            "port": (
+                f"wifi {CAR_HOST}"
+                if self._via == "wifi"
+                else (self.port or "(auto) usb")
+            ),
             "error": self.error if not alive else None,
             "car_action": car.value("car_action") if car else None,
             "reconnects": self.reconnects,

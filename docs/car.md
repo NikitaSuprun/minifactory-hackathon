@@ -103,6 +103,18 @@ Or read it over USB serial on boot (the `wifi_ip` event), or use `car.local`.
 
 ## Troubleshooting
 
+- **⚠️ This car's WiFi is a hardware fault — drive over USB.** The board broadcasts
+  its SSID and accepts associations (you get a DHCP lease) but **cannot pass ICMP/TCP
+  data** to any client. Proven exhaustively: it fails in AP *and* STA mode, on
+  battery/powerbank/USB power, on multiple networks, and — decisively — with a
+  **barebones WiFi sketch that has zero project code** (`firmware/minimal_wifi/`), to
+  **two independent clients** (a Mac and an Android phone). AP mode rules out client
+  isolation; the barebones sketch rules out the firmware. It's the radio/antenna.
+  Reflashing/network changes cannot fix it. `drive_dashboard.py` tries WiFi first
+  then auto-falls-back to USB, so a plain run just works over the cable. To verify a
+  *different* unit's WiFi: flash `firmware/minimal_wifi/` (`uv run pio run -d
+  firmware/minimal_wifi -t upload`), join its AP `carmin`/`minifactory`, open
+  `http://192.168.4.1` — "CAR WIFI OK" means that unit's radio is fine.
 - **"resource busy" on USB:** another program owns the port — close the atech web
   bridge / any serial monitor.
 - **Motors brown out / USB drops at speed:** keep speed ≤ 224 (the dashboard caps

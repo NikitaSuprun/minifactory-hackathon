@@ -106,6 +106,11 @@ class TcpTransport:
             pass
 
 
-def connect_wifi(host: str, port: int = DEFAULT_TCP_PORT) -> Board:
-    """Open an atech.Board to the car over WiFi (LAN TCP), by host/IP or mDNS name."""
-    return Board(TcpTransport(host, port))
+def connect_wifi(
+    host: str, port: int = DEFAULT_TCP_PORT, connect_timeout: float = 5.0
+) -> Board:
+    """Open an atech.Board to the car over WiFi (LAN TCP), by host/IP or mDNS name.
+
+    ``connect_timeout`` bounds the initial TCP connect — keep it short when WiFi is
+    only *tried* before falling back to USB serial."""
+    return Board(TcpTransport(host, port, connect_timeout=connect_timeout))
