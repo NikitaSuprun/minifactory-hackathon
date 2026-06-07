@@ -18,37 +18,36 @@ uv run python drive_dashboard.py            # auto-discovers the USB port
 Open http://localhost:8043. (Close the atech browser Web Serial bridge first, or
 the port is "resource busy".)
 
-**Wireless (WiFi, no cable):**
-1. Power the car on **battery** (USB not needed). It auto-joins WiFi in ~1–2 s.
-2. Put your Mac on the **same WiFi** as the car (currently `atech-temp`).
+**Wireless (WiFi, no cable) — AP mode:** the car is its OWN WiFi hotspot, so no
+router/DHCP/client-isolation is involved (a shared AP turned out unreliable).
+1. Power the car on **battery** (USB not needed). It starts its hotspot in ~1–2 s.
+2. On the Mac, **join the car's WiFi**: SSID **`atech-car`**, password **`minifactory`**.
+   ⚠️ One WiFi radio = no internet while on the car's hotspot. To keep internet too,
+   use a **USB-Ethernet** adapter for internet (WiFi stays on the car), or build a
+   **STA** variant that joins a phone hotspot (`WiFi.begin` — see git history).
 3. Run:
    ```
-   ATECH_CAR_HOST=car.local uv run python drive_dashboard.py
+   ATECH_CAR_HOST=192.168.4.1 uv run python drive_dashboard.py
    ```
-   If `car.local` (mDNS) doesn't resolve, use the IP (find it on your router; it's
-   been `192.168.100.244`): `ATECH_CAR_HOST=192.168.100.244 uv run python drive_dashboard.py`.
 
 Controls: arrows / **W A S D**, **Space** = stop. Speed slider (capped at 224 —
 above that the motor surge browns out the board). Buttons for jingles (Erika /
 Cuckoos), honk, and **record / replay / reverse**.
 
-## Change the WiFi network
+## Change the car's hotspot (SSID / password)
 
-Credentials are baked into the firmware at flash time (kept out of git in
-`.env.local`). To switch networks:
+The car runs as its own AP (`AP_SSID`/`AP_PASS` in `firmware/build_car_speaker.py`,
+default `atech-car` / `minifactory`; password must be ≥8 chars). To change it, set
+`CAR_AP_SSID` / `CAR_AP_PASS` (env) or edit the constants, then reflash over USB:
+```
+CAR_AP_SSID=my-car CAR_AP_PASS=drivecar1 uv run python firmware/build_car_speaker.py --upload
+```
+The car's IP is always **192.168.4.1**.
 
-1. Edit `.env.local`:
-   ```
-   WIFI_SSID=your-network
-   WIFI_PASS=your-password
-   ```
-   (Must be **2.4 GHz** — the ESP32 has no 5 GHz radio.)
-2. Reflash over USB:
-   ```
-   uv run python firmware/build_car_speaker.py --upload
-   ```
-3. Power-cycle on battery; it joins the new network. Read its new IP/mDNS as in
-   "Find the car's IP" below.
+**Want the car to join an existing WiFi instead (STA mode)** — e.g. so the Mac keeps
+internet on a non-isolating network or a phone hotspot? Switch `WiFi.mode(WIFI_AP)`
+/ `WiFi.softAP(...)` back to `WiFi.mode(WIFI_STA)` / `WiFi.begin(ssid, pass)` in
+`LOOP_CPP` (see git history for the STA version), put creds in `.env.local`, reflash.
 
 ## Reflash / build firmware
 
@@ -108,9 +107,10 @@ Or read it over USB serial on boot (the `wifi_ip` event), or use `car.local`.
   bridge / any serial monitor.
 - **Motors brown out / USB drops at speed:** keep speed ≤ 224 (the dashboard caps
   it). On battery the headroom is better. The dashboard auto-reconnects.
-- **WiFi unreachable:** give the board a few seconds after power-on; confirm the Mac
-  is on the same SSID; try the IP instead of `car.local`. The `atech-temp` network
-  is lossy — the watchdog reconnects through blips.
+- **WiFi unreachable:** make sure the Mac actually joined `atech-car` (it may
+  auto-rejoin a remembered network with internet); give the board a few seconds
+  after power-on; the car is always at `192.168.4.1`. The dashboard watchdog
+  reconnects on its own once you're on the car's hotspot.
 - **Wrong drive direction:** this car's motors are wired reversed, so the dashboard
   sends negated `motor_speed` for forward (the on-screen state label reads inverted
   — cosmetic). Flip `INVERT`/the sign in `command()` if you rewire.
@@ -118,7 +118,10 @@ Or read it over USB serial on boot (the `wifi_ip` event), or use `car.local`.
 ## For agents
 
 - **Run wired:** `uv run python drive_dashboard.py` (background it; poll
-  `curl -s localhost:8043/status`). **Run WiFi:** prefix `ATECH_CAR_HOST=car.local`.
+  `curl -s localhost:8043/status`). **Run WiFi:** join the car's AP `atech-car`
+  (`networksetup -setairportnetwork en0 atech-car minifactory`), then prefix
+  `ATECH_CAR_HOST=192.168.4.1`. (On the Mac, joining the AP drops internet — single
+  WiFi radio; use USB-ethernet for internet if you need both.)
 - **Drive:** `POST /cmd/{forward|back|left|right|stop}?speed=N`. **Sound:**
   `POST /sound/{erika|cuckoos|honk|stop}`. **Record:** `POST /record/{start|stop}`,
   `POST /replay/{forward|reverse|stop}`. `GET /status` has connection + car_action +
@@ -133,7 +136,8 @@ Or read it over USB serial on boot (the `wifi_ip` event), or use `car.local`.
   `WiFi.setSleep(false)` + `setAutoReconnect(true)`; gate **every** `Serial` write on
   `availableForWrite()` (a plugged-but-unread USB CDC otherwise blocks the whole
   loop and freezes WiFi).
-- **DHCP reassigns the IP** on reboot; prefer `car.local` or ARP-by-MAC over a fixed
-  IP.
+- **AP mode** = the car is its own hotspot at a fixed `192.168.4.1` (no DHCP-from-
+  router, no client isolation). A previous STA build chased a router IP via DHCP/mDNS
+  and was unreliable on isolating networks — see git history if you need STA.
 - **Secrets:** `WIFI_SSID`/`WIFI_PASS` live in `.env.local` (gitignored); the
   committed build script only has `__WIFI_SSID__` placeholders.

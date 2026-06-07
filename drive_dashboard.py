@@ -11,14 +11,14 @@ until changed; no deadman watchdog):
 Telemetry: car_action (state). car_speed exists but is a constant — ignore it.
 
 Run:
-    uv run python drive_dashboard.py                          # USB serial, http://localhost:8043
+    uv run python drive_dashboard.py                           # USB serial, http://localhost:8043
     ATECH_CAR_PORT=/dev/cu.usbmodem11201 uv run python drive_dashboard.py
-    ATECH_CAR_HOST=car.local uv run python drive_dashboard.py # WiFi (no cable!)
+    ATECH_CAR_HOST=192.168.4.1 uv run python drive_dashboard.py # WiFi (no cable!)
 
 Over USB: only one program can own the serial port — close the atech browser Web
-Serial bridge (and any probe/monitor) first. Over WiFi: set ATECH_CAR_HOST to the
-car's mDNS name (car.local) or IP; the car must be powered (battery) and on the
-same WiFi (firmware: firmware/build_car_speaker.py).
+Serial bridge (and any probe/monitor) first. Over WiFi: the car is its OWN hotspot
+(AP mode) — join its WiFi "atech-car" (pass "minifactory") from the Mac, then set
+ATECH_CAR_HOST=192.168.4.1 (firmware: firmware/build_car_speaker.py).
 """
 
 from __future__ import annotations

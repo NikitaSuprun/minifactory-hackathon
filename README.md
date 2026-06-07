@@ -309,11 +309,12 @@ over USB **or** WiFi. Full guide — operating, changing the WiFi network,
 reflashing, troubleshooting, and an agent cheat-sheet — in **[docs/car.md](docs/car.md)**.
 
 ```
-uv run python drive_dashboard.py                          # wired (USB), http://localhost:8043
-ATECH_CAR_HOST=car.local uv run python drive_dashboard.py # wireless (car on battery, same WiFi)
+uv run python drive_dashboard.py                            # wired (USB), http://localhost:8043
+ATECH_CAR_HOST=192.168.4.1 uv run python drive_dashboard.py # wireless (join the car's hotspot first)
 ```
-To change WiFi: edit `WIFI_SSID`/`WIFI_PASS` in `.env.local`, then reflash once:
-`uv run python firmware/build_car_speaker.py --upload`.
+Wireless is **AP mode**: the car is its own WiFi hotspot **`atech-car`** (pass
+`minifactory`, IP `192.168.4.1`). Join it from the Mac, then run the command above.
+(One WiFi radio, so the Mac has no internet while on the car's hotspot.)
 
 ## Notes
 

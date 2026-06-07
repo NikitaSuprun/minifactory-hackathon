@@ -18,8 +18,9 @@ over BOTH USB serial and a TCP socket (port 3333):
 
 Motors: fl=port1, rl=port6, fr=port9, rr=port14 (per firmware/PROMPT.md; right
 side mirrored so +motor_speed drives all wheels forward). Speaker: SPEAKER_PORTS.
-WiFi: STA mode, joins WIFI_SSID/WIFI_PASS (from .env.local), advertises car.local
-via mDNS, and runs a TCP server on port 3333.
+WiFi: AP mode — the car is its OWN hotspot (SSID CAR_AP_SSID, default "atech-car";
+IP 192.168.4.1), so there's no router/DHCP/client-isolation to fight. Join that
+network from the Mac, then run the dashboard with ATECH_CAR_HOST=192.168.4.1.
 
 First-time setup (this uv-managed venv lacks pip, which PlatformIO needs to
 install its esptool deps; esptool is also used for backup/restore):
@@ -57,18 +58,18 @@ MOTORS = {"fl": 1, "rl": 6, "fr": 9, "rr": 14}  # instance -> port (PROMPT.md)
 SPEAKER_PORTS = (3, 4)
 SPEAKER_INSTANCE = "spk"
 TCP_PORT = 3333
-WIFI_SSID = os.environ.get("WIFI_SSID", "")
-WIFI_PASS = os.environ.get("WIFI_PASS", "")
+# The car runs as its OWN WiFi access point (AP mode). Join this network from the
+# Mac, then point the dashboard at 192.168.4.1. Password must be >=8 chars (WPA2).
+AP_SSID = os.environ.get("CAR_AP_SSID", "atech-car")
+AP_PASS = os.environ.get("CAR_AP_PASS", "minifactory")
 BUILD_DIR = _REPO / "firmware" / "build" / NAME
 
 # All behavior lives in loop(). The local SDK does NOT auto-handle module actions,
 # so we parse the JSON ({"action":"..","value":".."}) ourselves and drive the
 # in-scope module instances (fl/rl/fr/rr DCMotor, spk Speaker). The same protocol
 # runs over Serial AND a TCP client (WiFi), so the car works tethered or wireless.
-# No deadman: commands latch until changed.
-#
-# __WIFI_SSID__ / __WIFI_PASS__ are substituted from env at build time so creds
-# never live in this committed file.
+# No deadman: commands latch until changed. __AP_SSID__/__AP_PASS__ are substituted
+# at build time (AP mode — the car is its own hotspot).
 LOOP_CPP = r"""
 static String rxS, rxW;
 static unsigned long lastTele = 0;
@@ -77,32 +78,21 @@ static int curSpeed = 0;
 static WiFiServer server(3333);
 static WiFiClient client;
 static bool wifiBegun = false;
-static bool serverUp = false;
 
-// Kick off the WiFi join once; start the TCP server + mDNS only AFTER the link
-// is up (begin()-before-connect leaves the listen socket in a bad state on ESP32).
+// AP mode: the car is its OWN WiFi hotspot — no router, so no client isolation /
+// DHCP / reachability problems (STA on a shared AP was unreliable). softAP() is
+// synchronous, so the AP + TCP server are up immediately at 192.168.4.1.
 if (!wifiBegun) {
     wifiBegun = true;
-    WiFi.mode(WIFI_STA);
-    WiFi.begin("__WIFI_SSID__", "__WIFI_PASS__");
-    WiFi.setSleep(false);       // disable modem power-save: low-latency, reliably reachable
-    WiFi.setAutoReconnect(true); // rejoin automatically if the AP de-auths us
-}
-// If the link drops (e.g. AP idle-deauth), rejoin — otherwise the board sits on a
-// dead "connected" link and new TCP clients get silence.
-static unsigned long lastWifiChk = 0;
-if (wifiBegun && millis() - lastWifiChk > 3000) {
-    lastWifiChk = millis();
-    if (WiFi.status() != WL_CONNECTED) WiFi.reconnect();
-}
-if (!serverUp && WiFi.status() == WL_CONNECTED) {
-    serverUp = true;
+    WiFi.mode(WIFI_AP);
+    WiFi.softAP("__AP_SSID__", "__AP_PASS__");
+    WiFi.setSleep(false);   // keep the link low-latency / responsive
     server.begin();
     server.setNoDelay(true);
     MDNS.begin("car");
     if (Serial && Serial.availableForWrite() > 90) {
         Serial.print("{\"type\":\"event\",\"payload\":{\"event_type\":\"state\",\"key\":\"wifi_ip\",\"value\":\"");
-        Serial.print(WiFi.localIP().toString());
+        Serial.print(WiFi.softAPIP().toString());
         Serial.println("\"}}");
     }
 }
@@ -169,7 +159,7 @@ auto handle = [&](const String& rx) {
 // only when one is actually pending (null otherwise), so calling it every loop
 // picks up (re)connections immediately and we drop any old/stale client. This
 // avoids the stale-connection deadlock of guarding the call on client state.
-if (serverUp) {
+if (wifiBegun) {
     WiFiClient nc = server.available();
     if (nc) {
         if (client) client.stop();
@@ -205,18 +195,14 @@ if (millis() - lastTele > 500) {
 
 
 def make_project() -> Project:
-    if not WIFI_SSID:
-        print(
-            "WARNING: WIFI_SSID is empty (set it in .env.local) — the firmware "
-            "will build but won't join WiFi; serial still works."
-        )
+    print(
+        f"AP mode: car hotspot SSID={AP_SSID!r} ({len(AP_PASS)}-char pass), IP 192.168.4.1"
+    )
     p = Project(board=BOARD, name=NAME)
     for inst, port in MOTORS.items():
         p.add("dc_motor", port=port, instance=inst)
     p.add("speaker", ports=SPEAKER_PORTS, instance=SPEAKER_INSTANCE)
-    loop = LOOP_CPP.replace("__WIFI_SSID__", WIFI_SSID).replace(
-        "__WIFI_PASS__", WIFI_PASS
-    )
+    loop = LOOP_CPP.replace("__AP_SSID__", AP_SSID).replace("__AP_PASS__", AP_PASS)
     p.set_loop(loop)
     issues = p.validate()
     if issues:
