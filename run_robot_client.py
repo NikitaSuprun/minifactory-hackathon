@@ -56,14 +56,6 @@ ACTIONS_PER_CHUNK: Final[str] = os.environ.get("ACTIONS_PER_CHUNK", "50")
 CHUNK_SIZE_THRESHOLD: Final[str] = os.environ.get("CHUNK_SIZE_THRESHOLD", "0.5")
 AGGREGATE_FN: Final[str] = os.environ.get("AGGREGATE_FN", "weighted_average")
 
-# When set, do all the slow setup (cameras + arm + server model load + a CUDA warmup
-# inference), then pause before the control loop until the dashboard writes the go flag.
-# This lets "Run inference" start the arm moving almost instantly. See inference_handshake.
-PREWARM: Final[bool] = os.environ.get("PREWARM", "0") == "1"
-# How often to poll for the go flag while paused after prewarm.
-GO_POLL_S: Final[float] = 0.05
-
-
 # Seconds to wait after claiming the camera lock so the dashboard can release the
 # devices (notably the OAK) before we open them.
 CAMERA_LOCK_GRACE_S: Final[float] = 2.0
@@ -72,7 +64,7 @@ CAMERA_LOCK_GRACE_S: Final[float] = 2.0
 def _cleanup() -> None:
     camera_lock.release()
     inference_handshake.clear_ready()
-    inference_handshake.clear_go()
+    inference_handshake.clear_control()
 
 
 def _release_and_exit(signum: int, frame: Any) -> None:
@@ -130,53 +122,83 @@ def main() -> None:
     client = RobotClient(client_cfg)
     # RobotClient.__init__ already connected the robot + opened the cameras (the slow part);
     # start() does the server handshake + SendPolicyInstructions, which makes the server load
-    # the policy model. Neither moves the arm — that only happens in the control loop below.
+    # the policy model. Neither moves the arm — that only happens when we perform actions in
+    # the control loop, and only while "following" is on.
     if not client.start():
         sys.exit("RobotClient failed to start (policy-server handshake failed).")
 
-    task = client_cfg.task
-    if PREWARM:
-        task = _prewarm_and_wait(client, task)
+    _warmup_server(client, client_cfg.task)
+    inference_handshake.mark_ready()
+    print("[client] ready — cameras + arm + server model loaded", flush=True)
 
     action_receiver = threading.Thread(target=client.receive_actions, daemon=True)
     action_receiver.start()
     try:
-        client.control_loop(task=task)
+        _control_loop(client, default_task=client_cfg.task)
     finally:
         client.stop()
         action_receiver.join()
 
 
-def _prewarm_and_wait(client: RobotClient, task: str) -> str:
-    """Warm the server (one discarded inference), mark ready, then block until the dashboard
-    writes the go flag. Returns the task to run (the go flag may override it). The arm stays
-    still throughout — we never call robot.send_action here."""
-    # Best-effort CUDA/kernel warmup on the server: push one observation through and force a
-    # single inference, discarding the result. control_loop_observation sends a must_go obs
-    # (clearing the must_go flag), so we re-set it afterwards to leave the client in the same
-    # state a fresh start would have for the real control loop's first observation.
+def _warmup_server(client: RobotClient, task: str) -> None:
+    """Best-effort CUDA/kernel warmup on the server: push one observation through and force a
+    single inference, discarding the result. control_loop_observation sends a must_go obs
+    (clearing the must_go flag), so we re-set it afterwards. The arm does not move — we never
+    call robot.send_action here."""
     try:
         client.control_loop_observation(task)
         client.stub.GetActions(services_pb2.Empty())  # pyright: ignore[reportAttributeAccessIssue]
     except Exception as e:  # noqa: BLE001 - warmup is best-effort; model is already loaded
-        print(f"[prewarm] warmup inference skipped: {e}", flush=True)
+        print(f"[client] warmup inference skipped: {e}", flush=True)
     client.must_go.set()
 
-    inference_handshake.clear_go()  # drop any stale go from a previous run
-    inference_handshake.mark_ready()
-    print(
-        "[prewarm] ready — cameras + arm + server model loaded; waiting for go",
-        flush=True,
-    )
 
+def _drain_action_queue(client: RobotClient) -> None:
+    """Drop any queued actions so (re)starting following begins from a fresh observation."""
+    with client.action_queue_lock:
+        client.action_queue.queue.clear()
+
+
+def _control_loop(client: RobotClient, default_task: str) -> None:
+    """Control loop honoring live follow/task control (mirrors RobotClient.control_loop).
+
+    While following: stream observations to the server and perform the returned actions.
+    While paused: hold the arm (never send_action) and keep the action queue empty so a
+    resume starts clean. The task is re-read from the control file every tick, so the
+    prompt can change without reloading the model. The subprocess stays alive across
+    pause/resume/task changes — only SIGTERM (Stop) tears it down."""
+    client.start_barrier.wait()  # release the action-receiver thread
+    dt = client.config.environment_dt
+    following_prev = False
+    task = default_task
     while client.running:
-        go = inference_handshake.read_go()
-        if go is not None:
-            inference_handshake.clear_ready()
-            inference_handshake.clear_go()
-            return go or task
-        time.sleep(GO_POLL_S)
-    return task
+        loop_start = time.perf_counter()
+
+        ctrl = inference_handshake.read_control()
+        if ctrl is not None:
+            following, ctrl_task = ctrl
+            task = ctrl_task or default_task
+        else:
+            following = (
+                following_prev  # transient read miss (atomic rewrite): keep state
+            )
+
+        if following:
+            if not following_prev:
+                # Just resumed/started: discard anything stale and force a fresh inference.
+                _drain_action_queue(client)
+                client.must_go.set()
+            if client.actions_available():
+                client.control_loop_action()
+            if client._ready_to_send_observation():
+                client.control_loop_observation(task)
+        else:
+            _drain_action_queue(
+                client
+            )  # paused: keep queue empty so the arm holds still
+
+        following_prev = following
+        time.sleep(max(0.0, dt - (time.perf_counter() - loop_start)))
 
 
 if __name__ == "__main__":

@@ -3,10 +3,12 @@ import {
   Cable,
   Hand,
   Play,
+  Pause,
   Square,
   Unplug,
   Cpu,
   Zap,
+  Check,
   AlertTriangle,
   Gamepad2,
   CircleDot,
@@ -89,21 +91,27 @@ export default function App() {
   const runInference = useCallback(() => {
     if (
       !confirm(
-        "Run inference frees the arm to the remote client and will MOVE it. Continue?",
+        "This frees the arm to the remote client and will MOVE it. Continue?",
       )
     )
       return;
     void act("/inference/start", { task });
   }, [act, task]);
 
+  const setLiveTask = useCallback(() => {
+    void act("/inference/task", { task });
+  }, [act, task]);
+
   const con = s?.connected ?? false;
   const tel = s?.teleop_running ?? false;
-  const inf = s?.inference_running ?? false; // subprocess owns the hardware (prewarm or run)
+  const inf = s?.inference_running ?? false; // subprocess owns the hardware (loading/warm/running)
   const rec = s?.recording_running ?? false;
   const istatus = s?.inference_status ?? "idle";
-  const running = istatus === "running";
-  const prewarming = istatus === "prewarming";
-  const prewarmed = istatus === "prewarmed";
+  const running = istatus === "running"; // following the policy (arm moving)
+  const ready = istatus === "ready"; // warm + holding (model loaded, arm still)
+  const prewarming = istatus === "prewarming"; // loading
+  const warm = running || ready; // subprocess alive with model loaded
+  const serverTask = s?.task ?? "";
 
   return (
     <div className="mx-auto max-w-6xl px-5 py-6">
@@ -198,7 +206,14 @@ export default function App() {
                 {s?.device ?? "cuda"}
               </span>
             </div>
-            <label className="text-xs text-slate-400">task prompt</label>
+            <label className="text-xs text-slate-400">
+              task prompt{" "}
+              {warm && (
+                <span className="text-slate-500">
+                  · changing it applies live, no reload
+                </span>
+              )}
+            </label>
             <div className="mt-1 flex flex-wrap items-center gap-2">
               <input
                 value={task}
@@ -206,12 +221,25 @@ export default function App() {
                   setTask(e.target.value);
                   setTaskEdited(true);
                 }}
-                disabled={running || rec}
+                onKeyDown={(e) => {
+                  if (e.key === "Enter" && warm && task !== serverTask)
+                    setLiveTask();
+                }}
+                disabled={rec}
                 className="min-w-72 flex-1 rounded-xl border border-white/10 bg-black/30 px-3 py-2 text-sm outline-none focus:border-indigo-400/60 disabled:opacity-50"
               />
               <Btn
+                onClick={setLiveTask}
+                disabled={!warm || task === serverTask}
+                icon={<Check size={16} />}
+              >
+                Set task
+              </Btn>
+            </div>
+            <div className="mt-2 flex flex-wrap items-center gap-2">
+              <Btn
                 onClick={() => act("/inference/prewarm")}
-                disabled={prewarming || prewarmed || running || rec}
+                disabled={prewarming || warm || rec}
                 icon={<Zap size={16} />}
               >
                 Prewarm
@@ -221,7 +249,14 @@ export default function App() {
                 disabled={running || rec}
                 icon={<Play size={16} />}
               >
-                Run inference
+                {ready ? "Resume" : "Run inference"}
+              </Btn>
+              <Btn
+                onClick={() => act("/inference/pause")}
+                disabled={!running}
+                icon={<Pause size={16} />}
+              >
+                Pause
               </Btn>
               <Btn
                 onClick={() => act("/inference/stop")}
@@ -233,10 +268,15 @@ export default function App() {
               </Btn>
               {prewarming && (
                 <Pill tone="warn" pulse>
-                  Prewarming…
+                  Loading…
                 </Pill>
               )}
-              {prewarmed && <Pill tone="on">Prewarmed — ready</Pill>}
+              {running && (
+                <Pill tone="on" pulse>
+                  Following
+                </Pill>
+              )}
+              {ready && <Pill tone="warn">Paused · warm</Pill>}
             </div>
           </Card>
 

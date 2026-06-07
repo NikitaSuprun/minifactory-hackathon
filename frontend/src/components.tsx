@@ -183,9 +183,9 @@ export function StatusPills({ s }: { s: Status }) {
       </Pill>
       <Pill
         tone={
-          s.inference_status === "running" || s.inference_status === "prewarmed"
+          s.inference_status === "running"
             ? "on"
-            : s.inference_status === "prewarming"
+            : s.inference_status === "prewarming" || s.inference_status === "ready"
               ? "warn"
               : s.inference_status === "error"
                 ? "err"
@@ -193,7 +193,14 @@ export function StatusPills({ s }: { s: Status }) {
         }
         pulse={s.inference_status === "running" || s.inference_status === "prewarming"}
       >
-        inference {s.inference_status}
+        inference{" "}
+        {s.inference_status === "running"
+          ? "following"
+          : s.inference_status === "ready"
+            ? "paused · warm"
+            : s.inference_status === "prewarming"
+              ? "loading"
+              : s.inference_status}
       </Pill>
       {s.record_status !== "idle" && (
         <Pill
