@@ -11,12 +11,14 @@ until changed; no deadman watchdog):
 Telemetry: car_action (state). car_speed exists but is a constant — ignore it.
 
 Run:
-    uv run python drive_dashboard.py            # http://localhost:8043
+    uv run python drive_dashboard.py                          # USB serial, http://localhost:8043
     ATECH_CAR_PORT=/dev/cu.usbmodem11201 uv run python drive_dashboard.py
+    ATECH_CAR_HOST=car.local uv run python drive_dashboard.py # WiFi (no cable!)
 
-Only one program can own the serial port — close the atech browser Web Serial
-bridge (and any probe/monitor) before starting, or the open fails with
-"resource busy".
+Over USB: only one program can own the serial port — close the atech browser Web
+Serial bridge (and any probe/monitor) first. Over WiFi: set ATECH_CAR_HOST to the
+car's mDNS name (car.local) or IP; the car must be powered (battery) and on the
+same WiFi (firmware: firmware/build_car_speaker.py).
 """
 
 from __future__ import annotations
@@ -31,11 +33,14 @@ from dotenv import load_dotenv
 from fastapi import FastAPI
 from fastapi.responses import HTMLResponse, JSONResponse
 
-from carlink import Car, connect_serial
+from carlink import Car, connect_serial, connect_wifi
 
 load_dotenv()
 
 CAR_PORT = os.environ.get("ATECH_CAR_PORT") or None  # None = auto-discover
+# Set ATECH_CAR_HOST (e.g. "car.local" or an IP) to drive over WiFi instead of
+# the USB cable — needs the WiFi firmware flashed (firmware/build_car_speaker.py).
+CAR_HOST = os.environ.get("ATECH_CAR_HOST") or None
 # 224 is the empirical ceiling — above it the motor surge browns out the board's
 # USB. Cap here so the slider/commands can't push past it.
 MAX_SPEED = int(os.environ.get("CAR_MAX_SPEED", "224"))
@@ -84,6 +89,7 @@ class CarLink:
         self.error: str | None = None
         self.last_cmd: tuple[str, int] | None = None  # replayed after a reconnect
         self.reconnects = 0
+        self._connected_at = 0.0
         self._lock = threading.Lock()
         self._watchdog = threading.Thread(target=self._watch, daemon=True)
         self._watchdog.start()
@@ -92,13 +98,19 @@ class CarLink:
         with self._lock:
             self._close_locked()
             try:
-                self.car = Car(connect_serial(self.port), name="car")
+                board = (
+                    connect_wifi(CAR_HOST) if CAR_HOST else connect_serial(self.port)
+                )
+                self.car = Car(board, name="car")
                 self.error = None
+                self._connected_at = time.time()
                 return True
             except Exception as e:  # noqa: BLE001
                 self.car = None
                 msg = str(e)
-                if any(s in msg.lower() for s in ("busy", "resource", "access")):
+                if CAR_HOST:
+                    msg += f" — can't reach the car at {CAR_HOST}:3333 (powered on & on WiFi?)"
+                elif any(s in msg.lower() for s in ("busy", "resource", "access")):
                     msg += " — close the atech web bridge / serial monitor first."
                 self.error = msg
                 return False
@@ -112,13 +124,21 @@ class CarLink:
         return "not configured" in e or "write failed" in e or "device" in e
 
     def _watch(self) -> None:
-        """Auto-recover from USB dropouts: when a send fails (the board browns out
-        and re-enumerates on a motor surge), reopen the port and replay the last
-        command so driving resumes without the user clicking reconnect."""
+        """Keep a live link: (re)connect whenever we're not connected — the initial
+        connect (board still booting over WiFi), a USB dropout, or a TCP drop (motor
+        brownout) — and replay the last command so driving resumes on its own."""
         while True:
-            time.sleep(0.25)
+            time.sleep(0.5)
             car = self.car
-            if car is not None and self._is_dead(car.last_send_error):
+            stale = car is None or self._is_dead(car.last_send_error)
+            if not stale and car is not None:
+                # connected, but telemetry silent for too long (e.g. the board was
+                # still settling when the socket opened) -> force a fresh connect.
+                age = car.age_ms("car_action")
+                since_conn = time.time() - self._connected_at
+                if since_conn > 4.0 and (age is None or age > 3000):
+                    stale = True
+            if stale:
                 if self.connect():
                     self.reconnects += 1
                     cmd = self.last_cmd
@@ -189,7 +209,7 @@ class CarLink:
         alive = car is not None and not self._is_dead(send_err)
         return {
             "connected": alive,
-            "port": self.port or "(auto)",
+            "port": (f"wifi {CAR_HOST}") if CAR_HOST else (self.port or "(auto)"),
             "error": self.error if not alive else None,
             "car_action": car.value("car_action") if car else None,
             "reconnects": self.reconnects,

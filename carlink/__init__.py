@@ -30,6 +30,7 @@ from .car import Car
 from .gateway import GatewayTransport, connect_gateway
 from .policy import CallablePolicy, Policy, PolicyRunner, StraightUntilObstacle
 from .util import as_bool, as_float
+from .wifi import TcpTransport, connect_wifi
 
 
 def connect_serial(port: str | None = None, baud: int = 115200) -> Board:
@@ -41,7 +42,9 @@ __all__ = [
     "Board",
     "connect_serial",
     "connect_gateway",
+    "connect_wifi",
     "GatewayTransport",
+    "TcpTransport",
     "Car",
     "Policy",
     "CallablePolicy",
