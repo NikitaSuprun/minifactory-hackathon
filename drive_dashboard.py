@@ -151,10 +151,11 @@ class CarLink:
                 raise RuntimeError(self.error or "not connected")
             car = self.car
             assert car is not None
+        # Motors are wired reversed on this car, so forward = negative motor_speed.
         if name == "forward":
-            car.drive(speed)  # -> motor_speed (+)
+            car.drive(-speed)
         elif name == "back":
-            car.drive(-speed)  # -> motor_speed (-)
+            car.drive(speed)
         elif name == "left":
             car.send(TURN_LEFT, speed)
         elif name == "right":
