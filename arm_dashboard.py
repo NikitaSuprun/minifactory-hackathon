@@ -48,6 +48,7 @@ from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
 import camera_lock
+import inference_handshake
 
 # Importing phone_camera loads .env and .env.local (HF_TOKEN) on import. The recording
 # helpers (build_cameras / resolve_hf_username / run_record_session) and the lerobot robot
@@ -130,7 +131,7 @@ class AppState:
     lock: threading.Lock = field(default_factory=threading.Lock)
     infer_proc: subprocess.Popen[bytes] | None = None
     infer_task: str = DEFAULT_POLICY_TASK
-    inference_status: str = "idle"  # idle | running | error
+    inference_status: str = "idle"  # idle | prewarming | prewarmed | running | error
     # Dataset recording runs in-process in a daemon thread, reusing the connected robot +
     # leader. The events dict is mutated by the /record/* endpoints (mirrors lerobot's
     # keyboard events); the worker reports phase/progress through the record_* fields.
@@ -352,10 +353,16 @@ def _teleop_worker() -> None:
 
 
 # --- Remote inference (managed subprocess) ----------------------------------
-def _start_inference(task: str) -> None:
-    # Free the hardware so run_robot_client.py can own the arm + all cameras. Disconnecting
-    # the follower also releases its cameras, so the subprocess can re-open the devices.
+def _spawn_client(task: str, *, prewarm: bool) -> None:
+    """Free the hardware and launch run_robot_client.py. With prewarm=True it opens the
+    cameras, connects the arm and makes the server load the model, then pauses before
+    moving the arm (status 'prewarming'); otherwise it runs inference immediately.
+
+    Disconnecting the follower also releases its cameras, so the subprocess can re-open
+    the devices."""
     _disconnect_arms()
+    inference_handshake.clear_ready()
+    inference_handshake.clear_go()
     CLIENT_LOG.parent.mkdir(parents=True, exist_ok=True)
     state.infer_task = task
     state.error = None
@@ -366,9 +373,29 @@ def _start_inference(task: str) -> None:
         stdout=logf,
         stderr=subprocess.STDOUT,
         start_new_session=True,
-        env={**os.environ, "POLICY_TASK": task},
+        env={**os.environ, "POLICY_TASK": task, "PREWARM": "1" if prewarm else "0"},
     )
-    state.inference_status = "running"
+    state.inference_status = "prewarming" if prewarm else "running"
+
+
+def _start_prewarm() -> None:
+    _spawn_client(state.infer_task, prewarm=True)
+
+
+def _start_inference(task: str) -> None:
+    # If a prewarmed (or still-prewarming) client is waiting, just release it into the
+    # control loop via the go flag — the slow setup is already done, so the arm starts
+    # moving almost instantly. If it's still prewarming, it picks up the go flag as soon
+    # as it reaches its wait loop.
+    if state.inference_running and state.inference_status in (
+        "prewarming",
+        "prewarmed",
+    ):
+        inference_handshake.signal_go(task)
+        state.infer_task = task
+        state.inference_status = "running"
+        return
+    _spawn_client(task, prewarm=False)
 
 
 def _stop_inference() -> None:
@@ -384,18 +411,29 @@ def _stop_inference() -> None:
                 pass
     state.infer_proc = None
     state.inference_status = "idle"
+    inference_handshake.clear_ready()
+    inference_handshake.clear_go()
 
 
 def _refresh_inference_state() -> None:
-    """Detect a finished/crashed inference subprocess and update status."""
+    """Detect a finished/crashed inference subprocess and update status, and promote a
+    prewarming client to 'prewarmed' once it signals ready."""
     proc = state.infer_proc
-    if proc is not None and proc.poll() is not None:
-        if state.inference_status == "running":
-            clean = proc.returncode in (0, -signal.SIGTERM)
-            state.inference_status = "idle" if clean else "error"
-            if not clean:
-                state.error = f"inference client exited (code {proc.returncode})"
-        state.infer_proc = None
+    if proc is None:
+        return
+    if proc.poll() is None:  # still alive
+        if state.inference_status == "prewarming" and inference_handshake.is_ready():
+            state.inference_status = "prewarmed"
+        return
+    # Subprocess exited.
+    if state.inference_status in ("running", "prewarming", "prewarmed"):
+        clean = proc.returncode in (0, -signal.SIGTERM)
+        state.inference_status = "idle" if clean else "error"
+        if not clean:
+            state.error = f"inference client exited (code {proc.returncode})"
+    state.infer_proc = None
+    inference_handshake.clear_ready()
+    inference_handshake.clear_go()
 
 
 # --- Dataset recording (in-process, reuses the connected robot + leader) -----
@@ -810,9 +848,26 @@ def teleop_stop() -> dict[str, str]:
     return {"status": "teleop stopped"}
 
 
+@app.post("/inference/prewarm")
+def inference_prewarm() -> dict[str, str]:
+    # Pre-open cameras, connect the arm and make the server load the model ahead of time so
+    # Run inference starts the arm moving almost instantly. The arm does not move yet.
+    if state.inference_status in ("prewarming", "prewarmed", "running"):
+        return {"status": state.inference_status}
+    if state.recording_running:
+        raise HTTPException(status_code=409, detail="Stop recording first.")
+    if not POLICY_SERVER_ADDRESS:
+        raise HTTPException(
+            status_code=400, detail="POLICY_SERVER_ADDRESS not set in .env."
+        )
+    with state.lock:
+        _start_prewarm()
+    return {"status": "prewarming"}
+
+
 @app.post("/inference/start")
 def inference_start(req: InferenceRequest) -> dict[str, str]:
-    if state.inference_running:
+    if state.inference_status == "running":
         return {"status": "already running"}
     if state.recording_running:
         raise HTTPException(status_code=409, detail="Stop recording first.")

@@ -27,10 +27,12 @@ from pathlib import Path
 from typing import Any, Final
 
 import camera_lock
+import inference_handshake
 
 from lerobot.async_inference.configs import RobotClientConfig
 from lerobot.async_inference.robot_client import RobotClient
 from lerobot.robots.so_follower.config_so_follower import SO101FollowerConfig
+from lerobot.transport import services_pb2  # type: ignore
 from lerobot.utils.import_utils import register_third_party_plugins
 
 # Importing recording pulls in phone_camera (which loads .env / .env.local) and the shared
@@ -54,15 +56,28 @@ ACTIONS_PER_CHUNK: Final[str] = os.environ.get("ACTIONS_PER_CHUNK", "50")
 CHUNK_SIZE_THRESHOLD: Final[str] = os.environ.get("CHUNK_SIZE_THRESHOLD", "0.5")
 AGGREGATE_FN: Final[str] = os.environ.get("AGGREGATE_FN", "weighted_average")
 
+# When set, do all the slow setup (cameras + arm + server model load + a CUDA warmup
+# inference), then pause before the control loop until the dashboard writes the go flag.
+# This lets "Run inference" start the arm moving almost instantly. See inference_handshake.
+PREWARM: Final[bool] = os.environ.get("PREWARM", "0") == "1"
+# How often to poll for the go flag while paused after prewarm.
+GO_POLL_S: Final[float] = 0.05
+
 
 # Seconds to wait after claiming the camera lock so the dashboard can release the
 # devices (notably the OAK) before we open them.
 CAMERA_LOCK_GRACE_S: Final[float] = 2.0
 
 
+def _cleanup() -> None:
+    camera_lock.release()
+    inference_handshake.clear_ready()
+    inference_handshake.clear_go()
+
+
 def _release_and_exit(signum: int, frame: Any) -> None:
     # The dashboard stops inference with SIGTERM; drop the lock so it resumes promptly.
-    camera_lock.release()
+    _cleanup()
     sys.exit(0)
 
 
@@ -77,7 +92,7 @@ def main() -> None:
     # exit path; a hard kill is covered by the dashboard's stale-pid check. The grace
     # delay lets the dashboard free the devices before we open them.
     camera_lock.acquire()
-    atexit.register(camera_lock.release)
+    atexit.register(_cleanup)
     signal.signal(signal.SIGTERM, _release_and_exit)
     time.sleep(CAMERA_LOCK_GRACE_S)
 
@@ -113,16 +128,55 @@ def main() -> None:
     # connect, run the action-receiver thread, drive the control loop, then tear down.
     register_third_party_plugins()
     client = RobotClient(client_cfg)
+    # RobotClient.__init__ already connected the robot + opened the cameras (the slow part);
+    # start() does the server handshake + SendPolicyInstructions, which makes the server load
+    # the policy model. Neither moves the arm — that only happens in the control loop below.
     if not client.start():
         sys.exit("RobotClient failed to start (policy-server handshake failed).")
+
+    task = client_cfg.task
+    if PREWARM:
+        task = _prewarm_and_wait(client, task)
 
     action_receiver = threading.Thread(target=client.receive_actions, daemon=True)
     action_receiver.start()
     try:
-        client.control_loop(task=client_cfg.task)
+        client.control_loop(task=task)
     finally:
         client.stop()
         action_receiver.join()
+
+
+def _prewarm_and_wait(client: RobotClient, task: str) -> str:
+    """Warm the server (one discarded inference), mark ready, then block until the dashboard
+    writes the go flag. Returns the task to run (the go flag may override it). The arm stays
+    still throughout — we never call robot.send_action here."""
+    # Best-effort CUDA/kernel warmup on the server: push one observation through and force a
+    # single inference, discarding the result. control_loop_observation sends a must_go obs
+    # (clearing the must_go flag), so we re-set it afterwards to leave the client in the same
+    # state a fresh start would have for the real control loop's first observation.
+    try:
+        client.control_loop_observation(task)
+        client.stub.GetActions(services_pb2.Empty())  # pyright: ignore[reportAttributeAccessIssue]
+    except Exception as e:  # noqa: BLE001 - warmup is best-effort; model is already loaded
+        print(f"[prewarm] warmup inference skipped: {e}", flush=True)
+    client.must_go.set()
+
+    inference_handshake.clear_go()  # drop any stale go from a previous run
+    inference_handshake.mark_ready()
+    print(
+        "[prewarm] ready — cameras + arm + server model loaded; waiting for go",
+        flush=True,
+    )
+
+    while client.running:
+        go = inference_handshake.read_go()
+        if go is not None:
+            inference_handshake.clear_ready()
+            inference_handshake.clear_go()
+            return go or task
+        time.sleep(GO_POLL_S)
+    return task
 
 
 if __name__ == "__main__":

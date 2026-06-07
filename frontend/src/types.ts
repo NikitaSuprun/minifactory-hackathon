@@ -2,7 +2,7 @@ export interface Status {
   connected: boolean;
   teleop_running: boolean;
   inference_running: boolean;
-  inference_status: string;
+  inference_status: "idle" | "prewarming" | "prewarmed" | "running" | "error";
   control_fps: number;
   camera_fps: { phone: number; wrist: number; camera3: number };
   joints: Record<string, number>;

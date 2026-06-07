@@ -6,6 +6,7 @@ import {
   Square,
   Unplug,
   Cpu,
+  Zap,
   AlertTriangle,
   Gamepad2,
   CircleDot,
@@ -19,6 +20,7 @@ import {
   CameraTile,
   JointTable,
   LogPanel,
+  Pill,
   StatusPills,
 } from "./components";
 import RecordTab from "./RecordTab";
@@ -96,8 +98,12 @@ export default function App() {
 
   const con = s?.connected ?? false;
   const tel = s?.teleop_running ?? false;
-  const inf = s?.inference_running ?? false;
+  const inf = s?.inference_running ?? false; // subprocess owns the hardware (prewarm or run)
   const rec = s?.recording_running ?? false;
+  const istatus = s?.inference_status ?? "idle";
+  const running = istatus === "running";
+  const prewarming = istatus === "prewarming";
+  const prewarmed = istatus === "prewarmed";
 
   return (
     <div className="mx-auto max-w-6xl px-5 py-6">
@@ -193,17 +199,28 @@ export default function App() {
               </span>
             </div>
             <label className="text-xs text-slate-400">task prompt</label>
-            <div className="mt-1 flex flex-wrap gap-2">
+            <div className="mt-1 flex flex-wrap items-center gap-2">
               <input
                 value={task}
                 onChange={(e) => {
                   setTask(e.target.value);
                   setTaskEdited(true);
                 }}
-                disabled={inf || rec}
+                disabled={running || rec}
                 className="min-w-72 flex-1 rounded-xl border border-white/10 bg-black/30 px-3 py-2 text-sm outline-none focus:border-indigo-400/60 disabled:opacity-50"
               />
-              <Btn onClick={runInference} disabled={inf || rec} icon={<Play size={16} />}>
+              <Btn
+                onClick={() => act("/inference/prewarm")}
+                disabled={prewarming || prewarmed || running || rec}
+                icon={<Zap size={16} />}
+              >
+                Prewarm
+              </Btn>
+              <Btn
+                onClick={runInference}
+                disabled={running || rec}
+                icon={<Play size={16} />}
+              >
                 Run inference
               </Btn>
               <Btn
@@ -214,6 +231,12 @@ export default function App() {
               >
                 Stop
               </Btn>
+              {prewarming && (
+                <Pill tone="warn" pulse>
+                  Prewarming…
+                </Pill>
+              )}
+              {prewarmed && <Pill tone="on">Prewarmed — ready</Pill>}
             </div>
           </Card>
 
