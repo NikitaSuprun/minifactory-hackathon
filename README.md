@@ -302,6 +302,19 @@ Verify with `uv run python scripts/check_phone_stream.py`.
 `640x480`, **Quality ~90–100%** (vs ~50% on WiFi), FPS limit `30`, continuous
 focus, audio off, and good even lighting. Prefer MJPEG over RTSP/H.264 (see Notes).
 
+## RC car (drive / sound / WiFi / record-replay)
+
+The atech RC car runs our own firmware and is driven from `drive_dashboard.py`
+over USB **or** WiFi. Full guide — operating, changing the WiFi network,
+reflashing, troubleshooting, and an agent cheat-sheet — in **[docs/car.md](docs/car.md)**.
+
+```
+uv run python drive_dashboard.py                          # wired (USB), http://localhost:8043
+ATECH_CAR_HOST=car.local uv run python drive_dashboard.py # wireless (car on battery, same WiFi)
+```
+To change WiFi: edit `WIFI_SSID`/`WIFI_PASS` in `.env.local`, then reflash once:
+`uv run python firmware/build_car_speaker.py --upload`.
+
 ## Notes
 
 - MJPEG over WiFi is typically ~100–200 ms latency. RTSP
