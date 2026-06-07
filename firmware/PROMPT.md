@@ -41,6 +41,26 @@ already speaks, and adds the hooks that make the host side robust.
   + watchdog timeout** — I'll match `Car` and the dashboard heartbeat to it.
 - Or just paste the regenerated `.cpp` and I'll read the interface off it.
 
+## Add the SPEAKER (for sound / jingles)
+
+The car board physically has the I2S speaker (MAX98357A), but the current firmware
+doesn't declare it, so `*_play_rtttl` does nothing. To enable sound, regenerate in
+the atech editor with this added (keep everything above unchanged):
+
+> Add the **speaker** module (`speaker`, I2S MAX98357A). It is a **double module**
+> — it occupies an **adjacent pair of ports**; place it on a free pair (the motors
+> use ports 1, 6, 9, 14, so e.g. **[2,3]** or **[7,8]** is free) and wire it there.
+> Give it the instance name **`spk`**. In `setup()` call `spk.begin()` and
+> `spk.setVolume(0.4f)`. Do **not** play anything on boot. Expose the standard
+> speaker actions over the existing JSON envelope so the host can drive it:
+> `spk_play_rtttl` (string RTTTL, plays in the background), `spk_set_volume`
+> (0.0–1.0 float), and `spk_stop`. Audio must play in the background FreeRTOS task
+> (non-blocking) so driving keeps working while a melody plays.
+
+After reflash, tell me the **speaker instance name** you used (the spec says `spk`).
+The dashboard already has 🍦 Jingle / 📣 Honk / Test buttons + a speaker-name box —
+set the box to that name (or `ATECH_SPEAKER=<name>`), hit Test, and it'll sound.
+
 ## Host side (I implement, no firmware needed)
 
 - `--sim` mode for the dashboard (run everything on `atech.MockTransport`, no car).
