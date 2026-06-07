@@ -209,6 +209,9 @@ def run_record_session(
                 dataset.clear_episode_buffer()
                 continue
 
+            # Near-instant when the dataset was created with streaming_encoding=True: video
+            # frames are encoded by background threads during capture, so this just finalizes
+            # the episode instead of blocking on a full encode between episodes.
             dataset.save_episode()
             recorded += 1
     return recorded

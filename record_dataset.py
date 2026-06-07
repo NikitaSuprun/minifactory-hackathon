@@ -62,6 +62,9 @@ LEADER_ID: Final[str] = os.environ.get("LEADER_ID", "so101_leader")
 
 DEFAULT_FPS: Final[int] = int(os.environ.get("INFERENCE_FPS", "30"))
 DEFAULT_TASK: Final[str] = os.environ.get("POLICY_TASK", "Pick up the cube")
+# Video codec for recorded datasets. "auto" picks a hardware encoder so streaming encoding
+# keeps up with the cameras in real time; "libsvtav1" is AV1 (software). See arm_dashboard.py.
+RECORD_VCODEC: Final[str] = os.environ.get("RECORD_VCODEC", "auto")
 
 # Seconds to wait after claiming the camera lock so the dashboard can release the
 # devices (notably the OAK) before we open them. Mirrors run_robot_client.py.
@@ -187,6 +190,10 @@ def main() -> None:
         robot_type=robot.name,
         use_videos=True,
         image_writer_threads=4,
+        # Encode video frames in background threads during capture so save_episode() is
+        # near-instant and recording runs continuously (no per-episode encode wait).
+        streaming_encoding=True,
+        vcodec=RECORD_VCODEC,
     )
 
     processors = make_default_processors()

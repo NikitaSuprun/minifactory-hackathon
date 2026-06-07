@@ -78,6 +78,10 @@ CALIB_DIR: Final[Path] = Path(
 PHONE_CAM_NAME: Final[str] = os.environ.get("ROBOT_CAMERA_NAME", "camera1")
 ARM_CAM_NAME: Final[str] = os.environ.get("ARM_CAM_NAME", "camera2")
 CAM3_NAME: Final[str] = os.environ.get("CAM3_NAME", "camera3")
+# Video codec for recorded datasets. "auto" picks a hardware encoder (h264_videotoolbox on
+# this Mac) so streaming encoding keeps up with 3 cameras @ fps in real time without dropping
+# frames; set to "libsvtav1" for AV1 (software, matches older datasets but may not keep up).
+RECORD_VCODEC: Final[str] = os.environ.get("RECORD_VCODEC", "auto")
 CLIENT_LOG: Final[Path] = _HERE / "logs" / "client.out"
 # Local LeRobot dataset cache (where record_dataset.py / the Hub store datasets on disk).
 LEROBOT_ROOT: Final[Path] = Path(
@@ -451,6 +455,10 @@ def _record_worker(req: RecordRequest) -> None:
             robot_type=state.robot.name,
             use_videos=True,
             image_writer_threads=4,
+            # Encode video frames in background threads *during* capture so save_episode()
+            # is near-instant and recording runs continuously (no per-episode encode wait).
+            streaming_encoding=True,
+            vcodec=RECORD_VCODEC,
         )
 
         # Hand off: stop the dashboard teleop loop and let record_loop be the sole driver of
