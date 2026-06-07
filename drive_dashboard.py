@@ -53,6 +53,16 @@ TURN_LEFT = "turn_left"
 TURN_RIGHT = "turn_right"
 STOP = "stop"
 
+# Inversion used to replay a recorded path in reverse (retrace to start): play the
+# segments in reverse order with each motion inverted — drive back, undo each turn.
+INVERT = {
+    "forward": "back",
+    "back": "forward",
+    "left": "right",
+    "right": "left",
+    "stop": "stop",
+}
+
 # Speaker instance name (atech speaker module -> <inst>_play_rtttl / _set_volume /
 # _stop). Not yet confirmed on this firmware, so it's configurable + testable from
 # the UI. Candidates to try by ear:
@@ -91,6 +101,15 @@ class CarLink:
         self.reconnects = 0
         self._connected_at = 0.0
         self._lock = threading.Lock()
+        # Path record/replay: a path is a list of (command, speed, duration_s) segments.
+        self.recording = False
+        self.segments: list[tuple[str, int, float]] = []
+        self._seg_name: str | None = None
+        self._seg_speed = 0
+        self._seg_t = 0.0
+        self.replaying: str | None = None  # None | "forward" | "reverse"
+        self._replay_thread: threading.Thread | None = None
+        self._replay_abort = threading.Event()
         self._watchdog = threading.Thread(target=self._watch, daemon=True)
         self._watchdog.start()
 
@@ -165,6 +184,8 @@ class CarLink:
         """Send one latching drive command. The firmware holds it until changed."""
         speed = max(0, min(MAX_SPEED, int(speed)))  # cap below the brownout ceiling
         self.last_cmd = (name, speed)  # remembered so the watchdog can replay it
+        if self.recording:
+            self._record_step(name, speed)
         car = self.car
         if car is None or self._is_dead(car.last_send_error):
             if not self.connect():  # re-discovers the port
@@ -203,6 +224,68 @@ class CarLink:
             car.send(f"{inst}_set_volume", 0.5)
             car.send(f"{inst}_play_rtttl", melody)
 
+    # -- path record / replay --
+    def start_record(self) -> None:
+        self.stop_replay()
+        self.recording = True
+        self.segments = []
+        self._seg_name = None
+
+    def _record_step(self, name: str, speed: int) -> None:
+        """Close the previous segment (with its held duration) and open a new one."""
+        now = time.time()
+        if self._seg_name is not None:
+            self.segments.append((self._seg_name, self._seg_speed, now - self._seg_t))
+        self._seg_name, self._seg_speed, self._seg_t = name, speed, now
+
+    def stop_record(self) -> None:
+        if self.recording and self._seg_name is not None:
+            self.segments.append(
+                (self._seg_name, self._seg_speed, time.time() - self._seg_t)
+            )
+        self.recording = False
+        self._seg_name = None
+
+    def start_replay(self, reverse: bool) -> None:
+        if not self.segments:
+            return
+        self.stop_replay()
+        self.recording = False
+        self._replay_abort.clear()
+        self.replaying = "reverse" if reverse else "forward"
+        self._replay_thread = threading.Thread(
+            target=self._replay_loop, args=(reverse,), daemon=True
+        )
+        self._replay_thread.start()
+
+    def _replay_loop(self, reverse: bool) -> None:
+        segs = list(reversed(self.segments)) if reverse else list(self.segments)
+        try:
+            for name, speed, dur in segs:
+                if self._replay_abort.is_set():
+                    break
+                cmd = INVERT.get(name, name) if reverse else name
+                try:
+                    self.command(cmd, speed)
+                except Exception:  # noqa: BLE001
+                    pass
+                end = time.time() + dur
+                while time.time() < end and not self._replay_abort.is_set():
+                    time.sleep(0.05)
+        finally:
+            try:
+                self.command("stop", 0)
+            except Exception:  # noqa: BLE001
+                pass
+            self.replaying = None
+
+    def stop_replay(self) -> None:
+        if self._replay_thread is not None and self._replay_thread.is_alive():
+            self._replay_abort.set()
+            self._replay_thread.join(timeout=2.0)
+        self.replaying = None
+        self._replay_abort.clear()
+
     def status(self) -> dict[str, Any]:
         car = self.car
         send_err = car.last_send_error if car else None
@@ -213,6 +296,9 @@ class CarLink:
             "error": self.error if not alive else None,
             "car_action": car.value("car_action") if car else None,
             "reconnects": self.reconnects,
+            "recording": self.recording,
+            "segments": len(self.segments),
+            "replaying": self.replaying,
         }
 
 
@@ -231,8 +317,37 @@ def _shutdown() -> None:
     link.close()
 
 
+@app.post("/record/{action}")
+def record(action: str) -> JSONResponse:
+    if action == "start":
+        link.start_record()
+    elif action == "stop":
+        link.stop_record()
+    else:
+        return JSONResponse(
+            {"ok": False, "error": f"unknown record {action!r}"}, status_code=400
+        )
+    return JSONResponse({"ok": True, **link.status()})
+
+
+@app.post("/replay/{mode}")
+def replay(mode: str) -> JSONResponse:
+    if mode == "forward":
+        link.start_replay(reverse=False)
+    elif mode == "reverse":
+        link.start_replay(reverse=True)
+    elif mode == "stop":
+        link.stop_replay()
+    else:
+        return JSONResponse(
+            {"ok": False, "error": f"unknown replay {mode!r}"}, status_code=400
+        )
+    return JSONResponse({"ok": True, **link.status()})
+
+
 @app.post("/cmd/{name}")
 def cmd(name: str, speed: int = DEFAULT_SPEED) -> JSONResponse:
+    link.stop_replay()  # a manual command overrides/aborts an active replay
     try:
         link.command(name, speed)
     except Exception as e:  # noqa: BLE001
@@ -325,6 +440,13 @@ PAGE = """<!doctype html>
     <input id="spk" value="__SPEAKER__" style="width:78px">
     <button class="mini" onclick="sound('test')">test</button>
   </div>
+  <div class="row">
+    <button class="mini" id="recbtn" onclick="rec()">⏺ record</button>
+    <button class="mini" onclick="replay('forward')">▶ replay</button>
+    <button class="mini" onclick="replay('reverse')">◀ reverse</button>
+    <button class="mini" onclick="replay('stop')">⏹ stop replay</button>
+    <span class="stat" id="path">—</span>
+  </div>
   <div class="stat"><span id="dot" class="dot"></span><span id="conn">…</span> &nbsp; state: <b id="action">—</b></div>
   <div class="hint">keys: W/↑ fwd · S/↓ back · A/← rotate L · D/→ rotate R · Space stop. Commands latch until changed.</div>
   <button class="mini" onclick="reconnect()">reconnect</button>
@@ -349,6 +471,15 @@ async function sound(kind){
   const inst = encodeURIComponent(document.getElementById('spk').value.trim() || 'speaker');
   try { await fetch(`/sound/${kind}?inst=${inst}`, {method:'POST'}); } catch(e){}
 }
+let recording = false;
+async function rec(){
+  recording = !recording;
+  try { await fetch(`/record/${recording?'start':'stop'}`, {method:'POST'}); } catch(e){}
+}
+async function replay(mode){
+  if(recording){ recording=false; try{ await fetch('/record/stop',{method:'POST'}); }catch(e){} }
+  try { await fetch(`/replay/${mode}`, {method:'POST'}); } catch(e){}
+}
 
 document.querySelectorAll('button.dir').forEach(b=>{
   b.addEventListener('click', ()=>send(b.dataset.cmd));
@@ -370,6 +501,11 @@ async function poll(){
     document.getElementById('conn').textContent = s.connected ? ('connected '+s.port) : ('disconnected'+(s.error?' — '+s.error:''));
     document.getElementById('dot').classList.toggle('ok', s.connected);
     document.getElementById('action').textContent = s.car_action ?? '—';
+    recording = !!s.recording;
+    document.getElementById('recbtn').classList.toggle('on', recording);
+    document.getElementById('recbtn').textContent = recording ? '⏹ stop rec' : '⏺ record';
+    const p = s.replaying ? ('replaying '+s.replaying) : (recording ? 'recording…' : '');
+    document.getElementById('path').textContent = `${p} · ${s.segments??0} segs`;
   }catch(e){}
 }
 setInterval(poll, 700); poll();
