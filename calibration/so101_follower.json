@@ -2,43 +2,43 @@
     "shoulder_pan": {
         "id": 1,
         "drive_mode": 0,
-        "homing_offset": -1797,
-        "range_min": 722,
-        "range_max": 3214
+        "homing_offset": -1756,
+        "range_min": 833,
+        "range_max": 3199
     },
     "shoulder_lift": {
         "id": 2,
         "drive_mode": 0,
-        "homing_offset": 1776,
-        "range_min": 1296,
-        "range_max": 3236
+        "homing_offset": 1880,
+        "range_min": 776,
+        "range_max": 3146
     },
     "elbow_flex": {
         "id": 3,
         "drive_mode": 0,
-        "homing_offset": -1844,
-        "range_min": 1034,
-        "range_max": 3120
+        "homing_offset": -1858,
+        "range_min": 920,
+        "range_max": 3126
     },
     "wrist_flex": {
         "id": 4,
         "drive_mode": 0,
-        "homing_offset": 1465,
-        "range_min": 847,
-        "range_max": 3236
+        "homing_offset": 1498,
+        "range_min": 817,
+        "range_max": 3199
     },
     "wrist_roll": {
         "id": 5,
         "drive_mode": 0,
-        "homing_offset": 1736,
+        "homing_offset": 1618,
         "range_min": 0,
         "range_max": 4095
     },
     "gripper": {
         "id": 6,
         "drive_mode": 0,
-        "homing_offset": 676,
-        "range_min": 2037,
-        "range_max": 3522
+        "homing_offset": 685,
+        "range_min": 2030,
+        "range_max": 3507
     }
 }
