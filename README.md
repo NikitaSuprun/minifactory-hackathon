@@ -1,323 +1,140 @@
-# minifactory-hackathon
+<div align="center">
 
-Stream an Android phone's camera to this Mac over WiFi and use it as a
-[LeRobot](https://github.com/huggingface/lerobot) camera for model inference and
-dataset recording.
+# 🏭 minifactory
 
-The phone runs the **IP Webcam** app and serves an MJPEG stream; LeRobot's
-`OpenCVCamera` opens that URL directly — no macOS driver or virtual camera needed.
+**A two-robot pick-and-place "minifactory" — an autonomous RC car delivers a cube, and a
+SO-101 arm running a learned ACT policy picks it up and drops it in the bin.**
 
-## Quickstart (start everything)
+🏆 *Built at a hackathon.* &nbsp;·&nbsp; Powered by [LeRobot](https://github.com/huggingface/lerobot)
 
-Three pieces — phone, GPU box (inference), Mac (arms + dashboard). Run `make` to
-see all commands.
+[![Model](https://img.shields.io/badge/🤗%20Model-ACT%20policy-yellow)](https://huggingface.co/nsuprun/merged-so101-49904152)
+[![Dataset](https://img.shields.io/badge/🤗%20Dataset-so101--pickup--merged-blue)](https://huggingface.co/datasets/nsuprun/so101-pickup-merged)
 
-1. **Phone:** open **IP Webcam** → Start server (must be on the same WiFi as the Mac).
-2. **GPU box (once / when needed):** `make server-deploy` — deploys + starts the
-   policy server on the 3090 over Tailscale. It stays running.
+![Demo — RC car delivers a cube, the SO-101 arm picks and places it](assets/demo.gif)
+
+</div>
+
+## What it is
+
+**minifactory** is a tabletop imitation-learning rig that closes a full
+deliver → pick → place loop between **two robots**:
+
+- An **[atech RC car](docs/car.md)** carries a small cube across the table and parks at a
+  pickup station in front of the arm.
+- A **SO-101 robotic arm**, driven by a learned **ACT policy**, watches the scene through
+  an Android phone (used as a wireless camera), a workspace camera, and an OAK-D depth
+  camera. It reaches down, grasps the cube off the car, swings over, and drops it into a
+  wooden bin.
+
+The interesting part is *how the robot learns to do this*. We teleoperate the arm
+(a **leader** arm puppeteering the **follower**) to record demonstrations as
+[LeRobot](https://github.com/huggingface/lerobot) datasets, merge the sessions, and push
+them to the Hugging Face Hub. A trained **ACT** policy then runs **remote inference on a
+GPU box** — the Mac owns the arm and cameras and streams observations over gRPC
+(via Tailscale); the GPU box returns action chunks in real time. No cloud camera, no
+custom drivers: the phone just serves an MJPEG stream that LeRobot opens directly.
+
+> The clip above is the real system: the cube is loaded onto the car, the car drives to
+> the station, and the policy-driven arm picks it up and bins it — fully autonomously.
+
+## The rig
+
+![The minifactory hardware setup](assets/setup.jpg)
+
+*SO-101 leader + follower arms, an Android phone running IP Webcam as a wireless camera,
+an OAK-D depth camera, the atech RC car, and a GPU box (RTX 3090) running the policy
+server over Tailscale.*
+
+## Architecture
+
+```mermaid
+flowchart TB
+  subgraph cams["📷 Sensing"]
+    Phone["📱 Phone — IP Webcam<br/>(MJPEG over WiFi/USB)"]
+    Wrist["🎥 Workspace camera"]
+    Oak["OAK-D depth camera"]
+  end
+
+  subgraph mac["💻 Mac — operator"]
+    Dash["arm_dashboard.py<br/>FastAPI + React UI"]
+    Client["run_robot_client.py"]
+    Arms["SO-101 leader → follower"]
+  end
+
+  subgraph gpu["🖥️ GPU box — RTX 3090"]
+    Server["run_policy_server.py<br/>ACT policy"]
+  end
+
+  HF["🤗 Hugging Face<br/>dataset + ACT model"]
+
+  subgraph fleet["🚗 Delivery"]
+    Car["atech RC car<br/>drive_dashboard.py / carlink"]
+    Orch["orchestrator<br/>state machine"]
+  end
+
+  Phone --> Dash
+  Wrist --> Dash
+  Oak --> Dash
+  Dash -->|"teleop → record episodes"| HF
+  HF -.->|"train + load ACT"| Server
+  Dash --> Client
+  Client <-->|"gRPC over Tailscale"| Server
+  Server -->|"action chunks"| Client
+  Client --> Arms
+  Orch --> Car
+  Orch --> Client
+  Car -->|"delivers cube"| Arms
+```
+
+## Models & data
+
+| | Hugging Face |
+|---|---|
+| 🧠 **Policy** (ACT, trained on the merged dataset) | **[nsuprun/merged-so101-49904152](https://huggingface.co/nsuprun/merged-so101-49904152)** |
+| 📦 **Dataset** (SO-101 cube pickup, merged sessions) | **[nsuprun/so101-pickup-merged](https://huggingface.co/datasets/nsuprun/so101-pickup-merged)** |
+
+## Quickstart
+
+Three pieces — **phone**, **GPU box** (inference), **Mac** (arms + dashboard). Run `make`
+to see all commands.
+
+1. **Phone:** open **IP Webcam** → *Start server* (same WiFi as the Mac). → [details](docs/cameras.md)
+2. **GPU box** (once / when needed): `make server-deploy` — deploys + starts the policy
+   server on the 3090 over Tailscale. It stays running. → [details](docs/inference.md)
 3. **Mac:** plug in both SO-101 arms, then `make dashboard` → open
    **http://localhost:8041** (login `admin` / `123123`).
    - **Connect arms** → **Start teleop** (leader drives follower), or
-   - **Run inference** → the dashboard launches the remote client; the policy on the
+   - **Run inference** → the dashboard launches the remote client; the ACT policy on the
      GPU box drives the follower from the phone + wrist cameras.
 
 First time only: `make find-port` (set ports in `.env`) and calibrate
 (`make calibrate-follower` / `make calibrate-leader`) — though calibration is already
-committed for our arms.
-
-## 1. Phone setup (IP Webcam)
-
-1. Install **IP Webcam** (by Pavel Khlebovich) from the Play Store.
-2. Open the app and, for low latency, set **Video preferences**:
-   - Resolution: `640x480` (modest is fine; lower = lower latency)
-   - Quality: ~50%
-   - FPS limit: 30
-   - Disable audio streaming
-3. (Optional) Protect the stream: under **Connection → Login/password**, set a
-   **Login** and **Password** (e.g. `admin` / `123123`). The stream then requires
-   HTTP Basic Auth.
-4. Scroll to the bottom and tap **Start server**.
-5. The app shows a URL like `http://192.168.1.42:8080`. The MJPEG stream is that
-   address + `/video`, e.g. `http://192.168.1.42:8080/video`.
-
-## 2. Network check
-
-Phone and Mac must be on the **same WiFi** (guest networks / "client isolation"
-will block this). Confirm by opening `http://<phone-ip>:8080` in the Mac's browser —
-you should see the live video and controls.
-
-## 3. Configure `.env`
-
-All connection settings live in the committed [`.env`](.env). Edit
-`PHONE_CAM_HOST` to your phone's IP (and the login/password if you set them):
-
-```dotenv
-PHONE_CAM_HOST=192.168.1.42
-PHONE_CAM_PORT=8080
-PHONE_CAM_PATH=/video
-PHONE_CAM_USER=admin
-PHONE_CAM_PASS=123123
-```
-
-The URL is assembled from these as `http://USER:PASS@HOST:PORT/PATH`. Set
-`PHONE_CAM_URL` instead if you want to override the whole thing.
-
-> The `.env` is committed on purpose for this hackathon. That means the password
-> is in git history — keep it a throwaway, LAN-only value, never a real secret.
-
-## 4. Verify ingestion via LeRobot
-
-```bash
-uv run python scripts/check_phone_stream.py            # uses .env
-# or pass an explicit URL (overrides .env):
-uv run python scripts/check_phone_stream.py http://admin:123123@<phone-ip>:8080/video
-```
-
-Expected: it prints the detected resolution, achieved FPS, and a latency proxy,
-then saves `stream_sample.png` showing the phone's camera view. That confirms
-LeRobot's `OpenCVCamera` is ingesting the stream.
-
-> `opencv-python-headless` (pulled in by LeRobot) has no GUI, so there's no live
-> preview window — use the phone's browser page for live view; the script proves
-> ingestion via stats + the saved snapshot.
-
-## 5. Use the phone camera in LeRobot (later)
-
-```python
-from phone_camera import build_phone_camera_config
-
-robot_config.cameras = {
-    "phone": build_phone_camera_config("http://192.168.1.42:8080/video"),
-}
-```
-
-`build_phone_camera_config` leaves `fps/width/height` unset so LeRobot auto-detects
-the stream profile — set resolution/FPS in the IP Webcam app, not in code.
-
-For a password-protected stream, embed credentials in the URL (optionally via the
-`with_credentials` helper):
-
-```python
-from phone_camera import build_phone_camera_config, with_credentials
-
-url = with_credentials("http://192.168.1.42:8080/video", "admin", "123123")
-robot_config.cameras = {"phone": build_phone_camera_config(url)}
-```
-
-## 6. Web control dashboard (SO-101 teleop)
-
-A minimal browser dashboard to control the SO-101 leader/follower pair lives in
-[`arm_dashboard.py`](arm_dashboard.py). **Both arms plug into this computer over
-USB.** It can connect/disconnect the arms, start/stop teleoperation (leader drives
-follower), shows the live phone camera, and polls status. Record + inference are
-scaffolded as TODO hooks (teleop first).
-
-Setup:
-
-1. Find the USB serial ports and put them in `.env`:
-   ```bash
-   uv run lerobot-find-port      # run once per arm, unplug to identify
-   ```
-   ```dotenv
-   FOLLOWER_PORT=/dev/tty.usbmodemXXXX
-   LEADER_PORT=/dev/tty.usbmodemYYYY
-   ```
-2. Set motor IDs — **only if the motors are fresh from the kit** (assigns IDs
-   1–6; connect one motor at a time when prompted). Skip for pre-assembled arms:
-   ```bash
-   uv run lerobot-setup-motors --robot.type=so101_follower --robot.port=$FOLLOWER_PORT
-   uv run lerobot-setup-motors --teleop.type=so101_leader  --teleop.port=$LEADER_PORT
-   ```
-3. Calibrate each arm once (interactive — needs a real terminal). Move the arm to
-   the middle/rest pose, press Enter, then sweep every joint through its full range:
-   ```bash
-   uv run lerobot-calibrate --robot.type=so101_follower --robot.port=$FOLLOWER_PORT --robot.id=so101_follower
-   uv run lerobot-calibrate --teleop.type=so101_leader  --teleop.port=$LEADER_PORT  --teleop.id=so101_leader
-   ```
-   The `--id` **must match** `ROBOT_ID` / `LEADER_ID` in `.env` — calibrations are
-   saved to `~/.cache/huggingface/lerobot/calibration/<type>/<id>.json` and loaded
-   by id at connect time. Persistent; redo only if you swap motors or change `--id`.
-
-   **This repo already ships calibration** under `calibration/so101_follower.json` and
-   `calibration/so101_leader.json`. The dashboard and `run_robot_client.py` point
-   `calibration_dir` there automatically (override with `CALIBRATION_DIR` in `.env`),
-   so connect won't re-prompt as long as the motors hold matching values. For bare
-   `lerobot-teleoperate`/`-record`, add `--robot.calibration_dir=calibration`.
-   Note: calibration is **per physical arm** — these files match *our* arms; recalibrate
-   if you use different hardware.
-4. Run the dashboard and open it:
-   ```bash
-   uv run python arm_dashboard.py    # http://localhost:8041
-   ```
-   The port is set by `DASHBOARD_PORT` in `.env` (default 8041).
-
-The dashboard is a **Vite + React + Tailwind** SPA (`frontend/`). The built bundle in
-`frontend/dist/` is committed and served by FastAPI, so the command above works with no
-Node step. It shows status pills, state-aware controls, the inference panel, phone +
-wrist camera tiles with live FPS, and the GPU-box + client log panels. To work on the
-UI:
-
-```bash
-cd frontend
-npm install
-npm run dev      # http://localhost:5173 (HMR, proxies the API to :8041)
-npm run build    # refresh frontend/dist (commit it)
-```
-
-If `frontend/dist` is absent, the dashboard falls back to a built-in inline HTML page.
-
-### Login (protects the dashboard + APIs)
-
-The dashboard binds to `0.0.0.0`, so it's reachable on the WiFi. Every route
-(page, APIs, camera) is behind **HTTP Basic Auth** — the browser shows a login
-prompt. Credentials come from `.env`:
-
-```dotenv
-DASHBOARD_USER=admin
-DASHBOARD_PASS=123123     # leave empty to disable auth (prints a warning)
-```
-
-> Like the camera, this is Basic Auth over plain HTTP on the LAN — fine for a
-> hackathon, but the password is base64 (not encrypted) on the wire. Keep it
-> throwaway.
-
-### Local (single-machine) VLA inference
-
-The dashboard's **Run inference** panel loads a Hugging Face policy *in this
-process* (`policy_inference.py`) and drives the follower from a task prompt. Fine
-for a quick local test on a Mac with a small policy (`lerobot/smolvla_base`);
-heavy VLAs (pi0) want the remote setup below. Gated models need `HF_TOKEN` in
-`.env.local` (gitignored — never commit it).
-
-## 7. Remote (two-machine) VLA inference
-
-For real VLAs, run inference on a GPU box and keep the arm on this Mac, using
-LeRobot's built-in async inference:
-
-```
-Phone ──MJPEG──▶ Mac (run_robot_client.py: reads camera, owns the SO-101)
-                   │
-                   └─gRPC: observations (incl. images) ─▶ GPU box (run_policy_server.py)
-                   ◀─gRPC: action chunks ────────────────┘
-```
-
-**The GPU box never connects to the phone** — the Mac reads the camera locally and
-ships decoded frames over gRPC. So no reverse proxy is needed for the camera. The
-only cross-network link is **Mac → `POLICY_SERVER_ADDRESS`** (the gRPC port). If
-the GPU box is in the cloud / behind NAT, make that port reachable one of two ways.
-
-**Option A — Tailscale (recommended).** A mesh VPN giving both machines stable
-`100.x` IPs through NAT; no tunnel needed.
-
-```bash
-# This Mac:
-brew install --cask tailscale            # then open the app, log in, Connect
-/Applications/Tailscale.app/Contents/MacOS/Tailscale ip -4
-
-# GPU box (Linux), same Tailscale account:
-curl -fsSL https://tailscale.com/install.sh | sh
-sudo tailscale up
-tailscale ip -4                          # -> use this as POLICY_SERVER_ADDRESS host
-```
-
-Then set `POLICY_SERVER_ADDRESS=<gpu-tailscale-ip>:8080` and run the server/client
-directly — no `run_tunnel.py`.
-
-**Option B — SSH tunnel.** If you can't use Tailscale, forward the port over SSH:
-
-```bash
-# helper: reads GPU_SSH_HOST / TUNNEL_LOCAL_PORT from .env and forwards the port
-uv run python run_tunnel.py
-# then set POLICY_SERVER_ADDRESS=localhost:8080
-```
-
-```dotenv
-GPU_SSH_HOST=ubuntu@gpu-box   # or user@<public-ip>
-GPU_SSH_PORT=22
-TUNNEL_LOCAL_PORT=8080
-```
-
-Configure both sides in `.env`:
-
-```dotenv
-POLICY_TYPE=smolvla                 # or pi0, act, …
-POLICY_PATH=lerobot/smolvla_base    # HF repo / checkpoint
-POLICY_TASK=Pick up the cube
-POLICY_SERVER_ADDRESS=192.168.1.50:8080   # GPU box, as seen from the Mac
-SERVER_POLICY_DEVICE=cuda           # device on the GPU box
-CLIENT_DEVICE=cpu                   # device on the Mac
-```
-
-Run it:
-
-```bash
-# On this Mac (arm + phone camera):
-uv run python run_robot_client.py
-```
-
-### Deploy the server to the GPU box (Ansible)
-
-Instead of setting up the box by hand, push + launch the server with the
-playbook in `deploy/` (rsyncs the repo — no GitHub auth needed on the box —
-installs uv, writes `.env.local` with your token, `uv sync`, and starts it):
-
-```bash
-HF_TOKEN=$(grep '^HF_TOKEN=' .env.local | cut -d= -f2-) \
-  uvx --from ansible-core ansible-playbook -i deploy/inventory.ini deploy/playbook.yml
-```
-
-Edit `deploy/inventory.ini` for your box's Tailscale IP / user. The token is read
-from the `HF_TOKEN` env var and written to the box's gitignored `.env.local` — it
-is never stored in the playbook or committed.
-
-`run_robot_client.py` assembles the LeRobot CLI from `.env`, including the phone
-camera (`resolve_phone_url()` injects the IP Webcam credentials). The client tells
-the server which policy to load.
-
-## Stream over USB (lowest latency, highest quality)
-
-Carry the same IP Webcam stream over the USB cable instead of WiFi. USB is a
-stable ~480 Mbps link (vs WiFi packet loss / latency spikes), so you can push the
-app's **Quality** near max at 640x480@30 — the MJPEG only needs ~5–15 Mbps.
-
-One-time setup:
-
-1. Install adb: `brew install android-platform-tools`.
-2. On the tablet: **Settings → Developer options → USB debugging** on, plug in
-   the cable, and accept the "Allow USB debugging?" prompt. Confirm with
-   `adb devices` (it should list the tablet as `device`).
-3. Keep **IP Webcam** running ("Start server") as usual.
-
-Then just flip the switch in [`.env`](.env):
-
-```dotenv
-PHONE_CAM_USB=true
-```
-
-The code forces the host to `localhost` and runs `adb forward` automatically (in
-`phone_camera.py`), so `PHONE_CAM_HOST` is ignored — no other changes needed.
-Verify with `uv run python scripts/check_phone_stream.py`.
-
-**Best quality at 640x480@30 over USB** — in the IP Webcam app: Resolution
-`640x480`, **Quality ~90–100%** (vs ~50% on WiFi), FPS limit `30`, continuous
-focus, audio off, and good even lighting. Prefer MJPEG over RTSP/H.264 (see Notes).
-
-## RC car (drive / sound / WiFi / record-replay)
-
-The atech RC car runs our own firmware and is driven from `drive_dashboard.py`
-over USB **or** WiFi. Full guide — operating, changing the WiFi network,
-reflashing, troubleshooting, and an agent cheat-sheet — in **[docs/car.md](docs/car.md)**.
-
-```
-uv run python drive_dashboard.py                            # wired (USB), http://localhost:8043
-ATECH_CAR_HOST=192.168.4.1 uv run python drive_dashboard.py # wireless (join the car's hotspot first)
-```
-Wireless is **AP mode**: the car is its own WiFi hotspot **`atech-car`** (pass
-`minifactory`, IP `192.168.4.1`). Join it from the Mac, then run the command above.
-(One WiFi radio, so the Mac has no internet while on the car's hotspot.)
-
-## Notes
-
-- MJPEG over WiFi is typically ~100–200 ms latency. RTSP
-  (`rtsp://<phone-ip>:8080/h264_ulaw.sdp`) is also available but tends to buffer
-  more in OpenCV — prefer MJPEG.
+committed for our arms. → [details](docs/arms.md)
+
+## Documentation
+
+| Doc | What's inside |
+|-----|---------------|
+| 📷 **[docs/cameras.md](docs/cameras.md)** | Phone (IP Webcam) setup, network check, `.env`, verifying ingestion, USB streaming, OAK-D |
+| 🦾 **[docs/arms.md](docs/arms.md)** | SO-101 ports, motor IDs, calibration, the dashboard UI, teleop, login |
+| 🧠 **[docs/inference.md](docs/inference.md)** | Running a policy — local on the Mac, or remote gRPC on the GPU box (Tailscale / SSH), Ansible deploy |
+| 📦 **[docs/datasets.md](docs/datasets.md)** | Recording demonstrations, merging, re-encoding, publishing to the Hub, episode viewer |
+| 🚗 **[docs/car.md](docs/car.md)** | The atech RC car — driving (USB / WiFi), firmware, record-replay, troubleshooting |
+| 🧭 **[docs/orchestrator.md](docs/orchestrator.md)** | Multi-robot mission state machine coordinating car delivery with arm pickup |
+
+## Tech stack
+
+- **Robot learning:** [LeRobot](https://github.com/huggingface/lerobot) (SO-101 drivers,
+  datasets, ACT/SmolVLA/pi0 policies, async gRPC inference) · PyTorch
+- **Dashboards:** FastAPI · React + Vite + Tailwind (built bundle served by FastAPI)
+- **Cameras:** Android *IP Webcam* (MJPEG over WiFi/USB) · Luxonis OAK-D (DepthAI)
+- **Networking:** Tailscale (mesh VPN) or SSH tunnel · Ansible for GPU-box deploy
+- **RC car:** ESP32-S3 firmware + the `carlink` Python control layer
+
+> **Note:** the `.env` in this repo is committed on purpose for the hackathon — every
+> credential in it is a throwaway, LAN-only value. Never put a real secret there;
+> gated-model tokens go in the gitignored `.env.local`.
+
+## License
+
+See [LICENSE](LICENSE).
